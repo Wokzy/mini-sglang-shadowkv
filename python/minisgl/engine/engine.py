@@ -66,7 +66,7 @@ class Engine:
 
         if config.shadowkv_config is not None and config.shadowkv_config.enabled:
             self.ctx.shadowkv_pool = ShadowKVPool(
-                config=ShadowKVConfig.maybe_from_additional_config(config.additional_config_dict),
+                config=config.shadowkv_config,
                 model_config=config.model_config,
                 max_batch_size=config.max_running_req + 1,
                 max_seq_len=config.max_seq_len,

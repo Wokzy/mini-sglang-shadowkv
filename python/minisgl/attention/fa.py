@@ -13,15 +13,13 @@ from .utils import BaseCaptureData
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
-from .shadowkv import ShadowKVMetadata, prepare_shadowkv_metadata
-
 
 @dataclass
 class FACaptureData(BaseCaptureData):
     pass
 
 
-@dataclass
+@dataclass(frozen=False)
 class FAMetadata(BaseAttnMetadata):
     cu_seqlens_k: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -30,11 +28,9 @@ class FAMetadata(BaseAttnMetadata):
     max_seqlen_q: int
 
     page_table: torch.Tensor
-    shadowkv_metadata: ShadowKVMetadata | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
-
 
 
 class FlashAttentionBackend(BaseAttnBackend):
@@ -50,6 +46,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.version = 4 if is_sm100_supported() else 3
 
         self.shadowkv_enabled = ctx.shadowkv_pool is not None
+        self.shadowkv_pool = ctx.shadowkv_pool
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -58,8 +55,12 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        # if batch.is_prefill:
-        #     shadowkv_compute_and_store_landmarks(k, self.shadowkv_landmarks, layer_id, batch)
+        if (
+            batch.is_prefill and self.shadowkv_enabled
+        ):  # TODO (@Wokzy): ensure chunked-prefill is disabled!
+            self.shadowkv_pool.compute_and_store_landmarks(
+                k, layer_id, [req.table_idx for req in batch.padded_reqs]
+            )
 
         return _fa_sgl_impl(
             q=q,
@@ -77,47 +78,47 @@ class FlashAttentionBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
 
-        if batch.is_prefill or not self.shadowkv_enabled:
-            padded_size = len(reqs)
-            seqlens_q = [req.extend_len for req in reqs]
-            seqlens_k = [req.device_len for req in reqs]
-            cached_lens = [req.cached_len for req in reqs]
-            max_seqlen_k = max(seqlens_k)
-            max_seqlen_q = max(seqlens_q)
-            CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        padded_size = len(reqs)
+        seqlens_q = [req.extend_len for req in reqs]
+        seqlens_k = [req.device_len for req in reqs]
+        cached_lens = [req.cached_len for req in reqs]
+        max_seqlen_k = max(seqlens_k)
+        max_seqlen_q = max(seqlens_q)
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
-            device = self.kvcache.device
-            cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS)
-            cache_seqlens = cache_seqlens.to(device, non_blocking=True)
-            cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
-            cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
+        device = self.kvcache.device
+        cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS)
+        cache_seqlens = cache_seqlens.to(device, non_blocking=True)
+        cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
+        cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
 
-            if max_seqlen_q == 1:
-                cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
-            elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
-                cu_seqlens_q = cu_seqlens_k
-            else:  # normal extend prefill, with partial cache hit
-                cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
-                cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
+        if max_seqlen_q == 1:
+            cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
+        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+            cu_seqlens_q = cu_seqlens_k
+        else:  # normal extend prefill, with partial cache hit
+            cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
+            cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
-            if self.shadowkv_enabled:
-                prepare_shadowkv_metadata(seqlens_k, [req.table_idx for req in reqs])
+        if batch.is_prefill and self.shadowkv_enabled:
+            # print([req.table_idx for req in reqs], batch.positions)
+            self.shadowkv_pool.prepare_shadowkv_metadata(seqlens_k, [req.table_idx for req in reqs])
 
-            page_table = get_global_ctx().page_table
-            new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
-                [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
-            )
-            if self.page_size > 1:
-                new_page_table.div_(self.page_size, rounding_mode="floor")
+        page_table = get_global_ctx().page_table
+        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
+            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+        )
+        if self.page_size > 1:
+            new_page_table.div_(self.page_size, rounding_mode="floor")
 
-            batch.attn_metadata = FAMetadata(
-                cu_seqlens_k=cu_seqlens_k,
-                cu_seqlens_q=cu_seqlens_q,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                max_seqlen_q=max_seqlen_q,
-                page_table=new_page_table,
-            )
+        batch.attn_metadata = FAMetadata(
+            cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            page_table=new_page_table,
+        )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."

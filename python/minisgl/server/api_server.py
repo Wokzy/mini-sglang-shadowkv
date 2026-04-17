@@ -173,7 +173,7 @@ class FrontendManager:
                 "object": "text_completion.chunk",
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
             }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
             if ack.finished:
                 break
@@ -184,7 +184,7 @@ class FrontendManager:
             "object": "text_completion.chunk",
             "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
         }
-        yield f"data: {json.dumps(end_chunk)}\n\n".encode()
+        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 

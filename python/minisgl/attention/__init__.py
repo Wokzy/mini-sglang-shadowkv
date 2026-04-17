@@ -13,7 +13,8 @@ logger = init_logger(__name__)
 
 
 class BackendCreator(Protocol):
-    def __call__(self, config: ModelConfig) -> BaseAttnBackend: ...
+    def __call__(self, config: ModelConfig) -> BaseAttnBackend:
+        ...
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -66,6 +67,7 @@ def create_attention_backend(
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
+
 
 from .shadowkv import ShadowKVPool, ShadowKVConfig
 
