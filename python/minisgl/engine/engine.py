@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
-from minisgl.attention import create_attention_backend
+from minisgl.attention import create_attention_backend, ShadowKVConfig, ShadowKVPool
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
@@ -61,6 +61,18 @@ class Engine:
             device=self.device,
             dtype=self.dtype,
         )
+
+        assert config.page_size == 1
+
+        if config.shadowkv_config is not None and config.shadowkv_config.enabled:
+            self.ctx.shadowkv_pool = ShadowKVPool(
+                config=ShadowKVConfig.maybe_from_additional_config(config.additional_config_dict),
+                model_config=config.model_config,
+                max_batch_size=config.max_running_req + 1,
+                max_seq_len=config.max_seq_len,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages

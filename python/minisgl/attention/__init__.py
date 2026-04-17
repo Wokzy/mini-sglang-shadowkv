@@ -67,10 +67,14 @@ def create_attention_backend(
 
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
 
+from .shadowkv import ShadowKVPool, ShadowKVConfig
+
 
 __all__ = [
     "BaseAttnMetadata",
     "BaseAttnBackend",
+    "ShadowKVConfig",
+    "ShadowKVPool",
     "create_attention_backend",
     "SUPPORTED_ATTENTION_BACKENDS",
     "validate_attn_backend",

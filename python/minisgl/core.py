@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal
+from typing import TYPE_CHECKING, List, Literal, Any
 
 import torch
 
@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
-
 
 @dataclass
 class SamplingParams:
@@ -105,6 +104,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    shadowkv_pool: Any = field(default=None, init=False) # TODO (@Wokzy) fix typing
     _batch: Batch | None = field(default=None, init=False)
 
     @property

@@ -11,7 +11,7 @@ from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
@@ -221,6 +221,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
+    )
+
+    parser.add_argument(
+        "--additional-config-path",
+        type=str,
+        default=None,
+        help="Path to additional engine config in JSON format",
     )
 
     # Parse arguments
