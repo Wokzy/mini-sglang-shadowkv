@@ -55,15 +55,18 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        if (
-            batch.is_prefill and self.shadowkv_enabled
-        ):  # TODO (@Wokzy): ensure chunked-prefill is disabled!
-            self.shadowkv_pool.compute_and_store_landmarks(
-                k, layer_id, [req.table_idx for req in batch.padded_reqs]
-            )
+        if self.shadowkv_enabled:  # TODO (@Wokzy): ensure chunked-prefill is disabled!
+            if batch.is_prefill:
+                self.shadowkv_pool.compute_and_store_landmarks(
+                    k, layer_id, [req.table_idx for req in batch.padded_reqs]
+                )
+            else:
+                self.shadowkv_pool.select_kv(q, layer_id)
+
+        # print(f"{q.shape=}")
 
         return _fa_sgl_impl(
-            q=q,
+            q=q,  # shape: (BS, num_qo_heads, HD)
             k_cache=self.kvcache.k_cache(layer_id),
             v_cache=self.kvcache.v_cache(layer_id),
             page_table=metadata.page_table,
@@ -100,9 +103,13 @@ class FlashAttentionBackend(BaseAttnBackend):
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
-        if batch.is_prefill and self.shadowkv_enabled:
+        if self.shadowkv_enabled:
+            batch_indices = [req.table_idx for req in reqs]
             # print([req.table_idx for req in reqs], batch.positions)
-            self.shadowkv_pool.prepare_shadowkv_metadata(seqlens_k, [req.table_idx for req in reqs])
+            if batch.is_prefill:
+                self.shadowkv_pool.prepare_shadowkv_metadata(seqlens_k, batch_indices)
+            else:
+                self.shadowkv_pool.prepare_batch_indices(batch_indices)
 
         page_table = get_global_ctx().page_table
         new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice

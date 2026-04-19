@@ -6,6 +6,8 @@ from minisgl.models.config import ModelConfig
 from minisgl.distributed import get_tp_info
 from minisgl.utils import div_even, init_logger
 
+from minisgl.kernel.shadowkv.shadowkv_score_landmarks import shadowkv_score_landmarks_kernel_hd128
+
 logger = init_logger(__name__)
 
 
@@ -44,7 +46,7 @@ class ShadowKVPool:
             raise RuntimeError("INITTING ShadowKV pool with shadowkv disabled is prohibited!")
 
         self.config = config
-        self.model_config = model_config
+        self.model_config: ModelConfig = model_config
         self.device = device
         self.dtype = dtype
 
@@ -54,6 +56,9 @@ class ShadowKVPool:
         )
 
         self.max_num_landmarks = max_seq_len // config.chunk_size
+        self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
+
+        assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
 
         self.landmarks_buffer = torch.empty(
             (
@@ -65,12 +70,27 @@ class ShadowKVPool:
             ),
             device=device,
             dtype=dtype,
-        )
+        ).contiguous()
 
-        self.prefix_end_indices = torch.empty((max_batch_size,), dtype=torch.long, device="cpu")
-        self.suffix_start_indices = torch.empty((max_batch_size,), dtype=torch.long, device="cpu")
-        self.num_chunks_to_select = torch.empty((max_batch_size,), dtype=torch.long, device="cpu")
-        self.batch_seqlens = torch.empty((max_batch_size,), dtype=torch.long, device="cpu")
+        self.prefix_end_indices = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        ).contiguous()
+        self.suffix_start_indices = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        ).contiguous()
+        self.num_chunks_to_select = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        ).contiguous()
+        self.total_num_chunks = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        ).contiguous()
+        self.batch_indices = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        ).contiguous()
+
+        # self.cuda_total_num_chunks = None
+        # self.cuda_prefix_end_indices = None
+        # self.cuda_s
 
     def landmarks(self, layer_idx: int) -> torch.Tensor:
         return self.landmarks_buffer[layer_idx]
@@ -78,55 +98,97 @@ class ShadowKVPool:
     def compute_and_store_landmarks(
         self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int]
     ):
-        assert len(batch_indices) == 1
+        assert len(batch_indices) == 1, key_states.shape
         batch_index = batch_indices[0]
 
         if self.prefix_end_indices[batch_index] == self.suffix_start_indices[batch_index]:
             return
 
-        key_states = key_states[self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]]
+        key_states = key_states[
+            self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
+        ]
         SL = key_states.shape[0]
         # print(layer_idx, SL, SL % self.config.chunk_size)
 
-        num_chunks = SL // self.config.chunk_size
+        num_chunks = self.total_num_chunks[batch_index]
 
         key_states = key_states.view(SL, self.local_kv_heads, self.model_config.head_dim).transpose(
             0, 1
         )
-        key_states = key_states.view(
-            self.local_kv_heads, num_chunks, self.config.chunk_size, self.model_config.head_dim
-        )
 
-        if layer_idx == 3:
-            print(key_states.shape)
-            print(self.landmarks_buffer[layer_idx, batch_index])
+        if self.config.chunk_size > 1:
+            key_states = key_states.view(
+                self.local_kv_heads, num_chunks, self.config.chunk_size, self.model_config.head_dim
+            )
 
-        new_landmarks = torch.mean(key_states, dim=2)
+            # if layer_idx == 3:
+            #     print(key_states.shape)
+            #     print(self.landmarks_buffer[layer_idx, batch_index])
+
+            new_landmarks = torch.mean(key_states, dim=2)
+        else:
+            new_landmarks = key_states
+
         self.landmarks_buffer[layer_idx, batch_index].index_copy_(
             dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
         )
 
-        if layer_idx == 3:
-            print(self.landmarks_buffer[layer_idx, batch_index])
+        # if layer_idx == 3:
+        #     print(self.landmarks_buffer[layer_idx, batch_index])
 
     def prepare_shadowkv_metadata(self, seqlens: list[int], batch_indices: list[int]):
         for SL, batch_index in zip(seqlens, batch_indices):
-
-            if (SL * self.config.total_budget < self.config.min_seqlen_to_prune) or self.config.total_budget == 1.0:
+            if (
+                SL * self.config.total_budget < self.config.min_seqlen_to_prune
+            ) or self.config.total_budget == 1.0:
                 self.prefix_end_indices[batch_index] = 0
                 self.suffix_start_indices[batch_index] = 0
+                self.total_num_chunks[batch_index] = 0
             else:
                 prefix_idx = math.floor(SL * self.config.prefix_budget)
                 suffix_idx = math.floor(SL - SL * self.config.prefix_budget)
 
                 sparse_gap = suffix_idx - prefix_idx
-                suffix_idx -= (sparse_gap % self.config.chunk_size)
+                suffix_idx -= sparse_gap % self.config.chunk_size
                 sparse_gap = suffix_idx - prefix_idx
 
-                self.num_chunks_to_select[batch_index] = math.ceil(min(SL * self.config.sparse_budget, sparse_gap)) // self.config.chunk_size
+                self.num_chunks_to_select[batch_index] = (
+                    math.ceil(min(SL * self.config.sparse_budget, sparse_gap))
+                    // self.config.chunk_size
+                )
                 self.prefix_end_indices[batch_index] = prefix_idx
                 self.suffix_start_indices[batch_index] = suffix_idx
+                self.total_num_chunks[batch_index] = sparse_gap // self.config.chunk_size
 
-            print(f'{SL=}')
+            print(f"{SL=}")
 
-        print(f'{self.prefix_end_indices=} {self.suffix_start_indices=} {self.num_chunks_to_select=}')
+        print(
+            f"{self.prefix_end_indices=} {self.suffix_start_indices=} {self.num_chunks_to_select=}"
+        )
+
+    def prepare_batch_indices(self, batch_indices: list[int]):
+        for i, batch_idx in enumerate(batch_indices):
+            self.batch_indices[i] = batch_idx
+
+    def select_kv(self, query_states: torch.Tensor, layer_idx: int):
+        BS, num_qo_heads, HD = query_states.shape
+        query_states = query_states.view(BS, 1, num_qo_heads, HD).transpose(1, 2)
+        query_states = query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD)
+
+        mean_query_states = torch.mean(query_states, dim=2).contiguous()
+        assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
+
+        assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
+        scores = shadowkv_score_landmarks_kernel_hd128(
+            mean_query_states,
+            self.landmarks_buffer[layer_idx],
+            self.local_kv_heads,
+            self.total_num_chunks,
+            self.max_num_landmarks,
+            self.batch_indices,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        # if layer_idx == 3:
+        #     print(scores.shape)
