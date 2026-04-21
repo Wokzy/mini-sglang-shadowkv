@@ -11,6 +11,10 @@
    - no cuda graph (yet)
    - --cache-type naive
 
+### code
+   -  kernels: `python/minisgl/kernel/shadowkv/`
+   -  implementation: `python/minisgl/attention/[shadowkv.py, fa.py]`
+
 - Example:
 ```bash
 python3 -m minisgl \
