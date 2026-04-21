@@ -6,7 +6,7 @@ from minisgl.models.config import ModelConfig
 from minisgl.distributed import get_tp_info
 from minisgl.utils import div_even, init_logger
 
-from minisgl.kernel.shadowkv.shadowkv_score_landmarks import shadowkv_score_landmarks_kernel_hd128
+from minisgl.kernel.shadowkv import shadowkv_score_landmarks_kernel_hd128
 
 logger = init_logger(__name__)
 
@@ -87,6 +87,12 @@ class ShadowKVPool:
         self.batch_indices = torch.empty(
             (max_batch_size,), dtype=torch.int32, device=self.device
         ).contiguous()
+
+        self.selected_chunks = torch.empty(
+            (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
+            dtype=torch.int64,
+            device=self.device,
+        )
 
         # self.cuda_total_num_chunks = None
         # self.cuda_prefix_end_indices = None
@@ -178,6 +184,7 @@ class ShadowKVPool:
         mean_query_states = torch.mean(query_states, dim=2).contiguous()
         assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
 
+        # SCORING
         assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
         scores = shadowkv_score_landmarks_kernel_hd128(
             mean_query_states,
@@ -190,5 +197,19 @@ class ShadowKVPool:
             dtype=self.dtype,
         )
 
-        # if layer_idx == 3:
-        #     print(scores.shape)
+        # TOPK
+        for i in range(BS):
+            batch_idx = self.batch_indices[i]
+            num_selected_chunks = self.num_chunks_to_select[batch_idx]
+            if num_selected_chunks == 0:
+                continue
+
+            self.selected_chunks[batch_idx].index_copy_(
+                dim=1,
+                index=torch.arange(0, num_selected_chunks, device=self.device),
+                source=torch.topk(
+                    scores[i][:, : self.total_num_chunks[batch_idx]],
+                    k=num_selected_chunks,
+                    sorted=False,
+                ).indices,
+            )
