@@ -2,6 +2,45 @@
 <img width="400" src="/assets/logo.png">
 </p>
 
+# Shadowkv
+
+## prerequisites
+   - flash-attention only!
+   - no chunked prefill
+   - page_size == 1
+   - no cuda graph (yet)
+   - --cache-type naive
+
+- Example:
+```bash
+python3 -m minisgl \
+    --model-path Qwen3-8B \
+    --additional-config-path additional_config.json \
+    --max-seq-len-override 16384 \
+    --max-prefill-length 16384 \
+    --tp-size 1 \
+    --graph 0 \
+    --attention-backend fa,fa \
+    --max-running-requests 2 \
+    --cache-type naive \
+    --host "localhost" \
+    --port 6889
+```
+
+additional_config.json
+```json
+{
+   "shadowkv_config": {
+      "enabled": true,
+      "chunk_size": 8,
+      "prefix_budget": 0.006125,
+      "sparse_budget": 0.125,
+      "suffix_budget": 0.06125,
+      "min_seqlen_to_prune": 512
+   }
+}
+```
+
 # Mini-SGLang
 
 A **lightweight yet high-performance** inference framework for Large Language Models.
