@@ -28,19 +28,17 @@ def test_shadowkv_score_kernel_gqa_after_score(BS, HC, gqa_factor, num_landmarks
 
     mean_query_states = torch.mean(query_states.view(BS, HC, gqa_factor, 1, HD), dim=2)
 
-    kernel_res = shadowkv_score_landmarks_kernel_hd128(
+    kernel_res = torch.empty((BS, HC, max_num_landmarks), **alloc_kwargs)
+
+    shadowkv_score_landmarks_kernel_hd128(
         mean_query_states,
+        kernel_res,
         landmarks,
         HC,
         cu_num_landmarks,
         max_num_landmarks,
         cu_batch_indices,
-        **alloc_kwargs,
     )
-
-    assert kernel_res.shape == (BS, HC, max_num_landmarks)
-
-    # torch_res = torch.zeros(BS, HC, max_num_landmarks, **alloc_kwargs)
 
     for i, batch_idx in enumerate(batch_indices):
         repeated_landmarks = torch.repeat_interleave(landmarks[batch_idx][:, :num_landmarks[batch_idx]], dim=0, repeats=gqa_factor)

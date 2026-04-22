@@ -44,14 +44,15 @@ def __shadowkv_score_landmarks_kernel_triton(
 
 def shadowkv_score_landmarks_kernel_hd128(
     query_states: torch.Tensor,
+    scores_output: torch.Tensor,
     landmarks: torch.Tensor,
     local_kv_heads: int,
     num_chunks: torch.Tensor,
     max_num_chunks: int,
     batch_indices: torch.Tensor,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+    # device: torch.device,
+    # dtype: torch.dtype,
+) -> None:
     BS, HD = len(batch_indices), 128
 
     query_states = query_states.contiguous()
@@ -62,9 +63,9 @@ def shadowkv_score_landmarks_kernel_hd128(
         (BS, local_kv_heads, 1, HD),
     )
 
-    scores = torch.empty(
-        (BS, local_kv_heads, max_num_chunks), dtype=dtype, device=device
-    ).contiguous()
+    # scores = torch.empty(
+    #     (BS, local_kv_heads, max_num_chunks), dtype=dtype, device=device
+    # ).contiguous()
     grid = lambda meta: (BS, local_kv_heads, max_num_chunks)
 
     __shadowkv_score_landmarks_kernel_triton[grid](
@@ -72,8 +73,8 @@ def shadowkv_score_landmarks_kernel_hd128(
         query_states.stride(),
         landmarks,
         landmarks.stride(),
-        scores,
-        scores.stride(),
+        scores_output,
+        scores_output.stride(),
         num_chunks,
         num_chunks.stride(),
         batch_indices,
@@ -83,4 +84,4 @@ def shadowkv_score_landmarks_kernel_hd128(
 
     # scores *= (HD ** -.5)
 
-    return scores
+    # return scores

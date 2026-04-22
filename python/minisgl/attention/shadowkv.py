@@ -95,14 +95,24 @@ class ShadowKVPool:
             (max_batch_size,), dtype=torch.int32, device=self.device
         ).contiguous()
 
+        # RUNTIME BUFFERS:
+
         self.selected_chunks = torch.empty(
             (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
             dtype=torch.int64,
             device=self.device,
         ).contiguous()
-        self.selected_indices = torch.zeros(
-            (max_batch_size, self.local_kv_heads, max_seq_len),
-            dtype=torch.int64,
+        self.selected_indices = (
+            torch.zeros(  # prefix + sparse + suffix KV cache indices in page table
+                (max_batch_size, self.local_kv_heads, max_seq_len),
+                dtype=torch.int64,
+                device=self.device,
+            ).contiguous()
+        )
+
+        self._topk_values_buffer = torch.empty(
+            (self.local_kv_heads, self.max_num_landmarks),
+            dtype=self.dtype,
             device=self.device,
         ).contiguous()
 
@@ -110,6 +120,12 @@ class ShadowKVPool:
             (2, max_batch_size * max_seq_len, 1, self.local_kv_heads, self.model_config.head_dim),
             dtype=self.dtype,
             device=self.device,
+        ).contiguous()
+
+        self.scores = torch.empty(
+            (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
+            dtype=dtype,
+            device=device,
         ).contiguous()
 
         self.seqlens = torch.zeros(
@@ -294,15 +310,14 @@ class ShadowKVPool:
         # assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
 
         # SCORING
-        scores = shadowkv_score_landmarks_kernel_hd128(
+        shadowkv_score_landmarks_kernel_hd128(
             mean_query_states,
+            self.scores,
             self.landmarks_buffer[layer_idx],
             self.local_kv_heads,
             self.total_num_chunks,
             self.max_num_landmarks,
             self.batch_indices[:BS],
-            device=self.device,
-            dtype=self.dtype,
         )
 
         # TOPK
@@ -312,14 +327,24 @@ class ShadowKVPool:
             if num_selected_chunks == 0:
                 continue
 
-            self.selected_chunks[batch_idx].index_copy_(
-                dim=1,
-                index=torch.arange(0, num_selected_chunks, device=self.device),
-                source=torch.topk(
-                    scores[i][:, : self.total_num_chunks[batch_idx]],
-                    k=num_selected_chunks,
-                    sorted=False,
-                ).indices,
+            # self.selected_chunks[batch_idx].index_copy_(
+            #     dim=1,
+            #     index=torch.arange(0, num_selected_chunks, device=self.device),
+            #     source=torch.topk(
+            #         self.scores[i][:, : self.total_num_chunks[batch_idx]],
+            #         k=num_selected_chunks,
+            #         sorted=False,
+            #     ).indices,
+            # )
+
+            torch.topk(
+                self.scores[i][:, : self.total_num_chunks[batch_idx]],
+                k=num_selected_chunks,
+                sorted=False,
+                out=(
+                    self._topk_values_buffer[:, :num_selected_chunks],
+                    self.selected_chunks[batch_idx][:, :num_selected_chunks],
+                ),
             )
 
             # PREPARE INDICES
@@ -335,27 +360,23 @@ class ShadowKVPool:
             #         source=prefix_arange.unsqueeze(0).expand(self.local_kv_heads, prefix_end),
             #     )
 
-            num_selected_chunks = self.num_chunks_to_select[batch_idx]
-
-            if num_selected_chunks != 0:
-                offsets = torch.arange(0, self.config.chunk_size, device=self.device)
-                sparse_indices = (
-                    self.selected_chunks[batch_idx][:, :num_selected_chunks]
-                    * self.config.chunk_size
-                    + prefix_end
-                ).unsqueeze(-1) + offsets
-                sparse_indices = sparse_indices.reshape(
-                    self.local_kv_heads, num_selected_chunks * self.config.chunk_size
-                )
-                self.selected_indices[batch_idx].index_copy_(
-                    dim=1,
-                    index=torch.arange(
-                        prefix_end,
-                        prefix_end + num_selected_chunks * self.config.chunk_size,
-                        device=self.device,
-                    ),
-                    source=sparse_indices,
-                )
+            offsets = torch.arange(0, self.config.chunk_size, device=self.device)
+            sparse_indices = (
+                self.selected_chunks[batch_idx][:, :num_selected_chunks] * self.config.chunk_size
+                + prefix_end
+            ).unsqueeze(-1) + offsets
+            sparse_indices = sparse_indices.reshape(
+                self.local_kv_heads, num_selected_chunks * self.config.chunk_size
+            )
+            self.selected_indices[batch_idx].index_copy_(
+                dim=1,
+                index=torch.arange(
+                    prefix_end,
+                    prefix_end + num_selected_chunks * self.config.chunk_size,
+                    device=self.device,
+                ),
+                source=sparse_indices,
+            )
 
             index = prefix_end + num_selected_chunks * self.config.chunk_size
             num_suffix_tokens = self.seqlens[batch_idx] - self.suffix_start_indices[batch_idx]
