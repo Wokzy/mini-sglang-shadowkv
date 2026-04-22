@@ -1,6 +1,6 @@
 import math
 import torch
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 from minisgl.models.config import ModelConfig
 from minisgl.distributed import get_tp_info
@@ -188,7 +188,7 @@ class ShadowKVPool:
                 self.total_num_chunks[batch_index] = 0
             else:
                 prefix_idx = math.floor(SL * self.config.prefix_budget)
-                suffix_idx = math.floor(SL - SL * self.config.prefix_budget)
+                suffix_idx = math.floor(SL - SL * self.config.suffix_budget)
 
                 sparse_gap = suffix_idx - prefix_idx
                 suffix_idx -= sparse_gap % self.config.chunk_size
