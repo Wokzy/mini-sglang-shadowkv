@@ -212,6 +212,38 @@ class ShadowKVPool:
                 f"req {batch_index} SL {SL} -> {pruned_sl} ({100 * pruned_sl / SL:.2f}%)"
             )
 
+            no_suffix_pruned_sl = int(
+                self.prefix_end_indices[batch_index]
+                + self.num_chunks_to_select[batch_index] * self.config.chunk_size
+            )
+
+            suffix_indices_arange = torch.arange(
+                self.suffix_start_indices[batch_index], self.max_seq_len, device=self.device
+            )
+
+            if len(suffix_indices_arange) != 0:
+                indices_arange = torch.arange(
+                    no_suffix_pruned_sl,
+                    no_suffix_pruned_sl + len(suffix_indices_arange),
+                    device=self.device,
+                )
+                self.selected_indices[batch_index].index_copy_(
+                    dim=1,
+                    index=indices_arange,
+                    source=suffix_indices_arange.unsqueeze(0).expand(
+                        self.local_kv_heads, len(suffix_indices_arange)
+                    ),
+                )
+
+            prefix_end = self.prefix_end_indices[batch_index]
+            if prefix_end != 0:
+                prefix_arange = torch.arange(0, prefix_end, device=self.device)
+                self.selected_indices[batch_index].index_copy_(
+                    dim=1,
+                    index=prefix_arange,
+                    source=prefix_arange.unsqueeze(0).expand(self.local_kv_heads, prefix_end),
+                )
+
         # print(
         #     f"{self.prefix_end_indices=} {self.suffix_start_indices=} {self.num_chunks_to_select=}"
         # )
@@ -254,11 +286,12 @@ class ShadowKVPool:
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
-        query_states = query_states.view(BS, 1, num_qo_heads, HD).transpose(1, 2)
-        query_states = query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD)
 
-        mean_query_states = torch.mean(query_states, dim=2).contiguous()
-        assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
+        mean_query_states = torch.mean(
+            query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD), dim=2
+        )
+        assert mean_query_states.is_contiguous()
+        # assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
 
         # SCORING
         scores = shadowkv_score_landmarks_kernel_hd128(
@@ -267,7 +300,7 @@ class ShadowKVPool:
             self.local_kv_heads,
             self.total_num_chunks,
             self.max_num_landmarks,
-            self.batch_indices,
+            self.batch_indices[:BS],
             device=self.device,
             dtype=self.dtype,
         )
@@ -289,18 +322,18 @@ class ShadowKVPool:
                 ).indices,
             )
 
-        # PREPARE INDICES
-        for i in range(BS):
-            batch_idx = self.batch_indices[i]
+            # PREPARE INDICES
+
             prefix_end = self.prefix_end_indices[batch_idx]
 
-            if prefix_end != 0:
-                prefix_arange = torch.arange(0, prefix_end, device=self.device)
-                self.selected_indices[batch_idx].index_copy_(
-                    dim=1,
-                    index=prefix_arange,
-                    source=prefix_arange.unsqueeze(0).expand(self.local_kv_heads, prefix_end),
-                )
+            # Already done on PREFILL
+            # if prefix_end != 0:
+            #     prefix_arange = torch.arange(0, prefix_end, device=self.device)
+            #     self.selected_indices[batch_idx].index_copy_(
+            #         dim=1,
+            #         index=prefix_arange,
+            #         source=prefix_arange.unsqueeze(0).expand(self.local_kv_heads, prefix_end),
+            #     )
 
             num_selected_chunks = self.num_chunks_to_select[batch_idx]
 
@@ -327,21 +360,22 @@ class ShadowKVPool:
             index = prefix_end + num_selected_chunks * self.config.chunk_size
             num_suffix_tokens = self.seqlens[batch_idx] - self.suffix_start_indices[batch_idx]
 
-            if num_suffix_tokens != 0:
-                suffix_arange = torch.arange(index, index + num_suffix_tokens, device=self.device)
-                suffix_index_arange = torch.arange(
-                    self.suffix_start_indices[batch_idx],
-                    self.seqlens[batch_idx],
-                    device=self.device,
-                )
+            # Already done on PREFILL
+            # if num_suffix_tokens != 0:
+            #     suffix_arange = torch.arange(index, index + num_suffix_tokens, device=self.device)
+            #     suffix_index_arange = torch.arange(
+            #         self.suffix_start_indices[batch_idx],
+            #         self.seqlens[batch_idx],
+            #         device=self.device,
+            #     )
 
-                self.selected_indices[batch_idx].index_copy_(
-                    dim=1,
-                    index=suffix_arange,
-                    source=suffix_index_arange.unsqueeze(0).expand(
-                        self.local_kv_heads, num_suffix_tokens
-                    ),
-                )
+            #     self.selected_indices[batch_idx].index_copy_(
+            #         dim=1,
+            #         index=suffix_arange,
+            #         source=suffix_index_arange.unsqueeze(0).expand(
+            #             self.local_kv_heads, num_suffix_tokens
+            #         ),
+            #     )
 
             assert self.num_tokens_to_gather[batch_idx] == index + num_suffix_tokens
 
@@ -358,7 +392,7 @@ class ShadowKVPool:
             self.local_kv_heads,
             self.selected_indices,
             self.num_tokens_to_gather,
-            self.batch_indices,
+            self.batch_indices[:BS],
             self.max_seq_len,
         )
 
