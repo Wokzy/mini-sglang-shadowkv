@@ -144,11 +144,7 @@ class ShadowKVPool:
             device=device,
         ).contiguous()
 
-        self.seqlens = torch.zeros(
-            (max_batch_size,),
-            dtype=torch.int32,
-            device=self.device,
-        ).contiguous()
+        self.seqlens = [0] * max_batch_size
 
         self.num_tokens_to_gather = torch.zeros(
             (max_batch_size,),
@@ -156,49 +152,46 @@ class ShadowKVPool:
             device=self.device,
         ).contiguous()
 
-        self.imag_page_table = (
-            torch.arange(
-                0,
-                max_seq_len,
-                device=self.device,
-            )
-            .to(dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(max_batch_size, max_seq_len)
-        )
+        self.imag_page_table = torch.stack(
+            [
+                torch.arange(i * max_seq_len, (i + 1) * max_seq_len, device=device)
+                for i in range(max_batch_size)
+            ],
+            dim=0,
+        ).to(dtype=torch.int32)
+
+        print(f"{self.imag_page_table=}")
 
     def compute_and_store_landmarks(
         self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int]
     ):
-        assert len(batch_indices) == 1, key_states.shape
+        assert len(batch_indices) == 1
+
         batch_index = batch_indices[0]
         num_chunks = self.total_num_chunks[batch_index]
 
         if num_chunks == 0:
             return
 
-        key_states = key_states[
+        key_states_loc = key_states[
             self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
         ]
-        SL = key_states.shape[0]
+        SL = key_states_loc.shape[0]
+        # assert SL > 0, f"{key_states.shape} {batch_indices=} {self.prefix_end_indices[batch_index]} {self.suffix_start_indices[batch_index]}"
         # print(layer_idx, SL, SL % self.config.chunk_size)
 
-        key_states = key_states.view(SL, self.local_kv_heads, self.model_config.head_dim).transpose(
-            0, 1
-        )
+        key_states_loc = key_states_loc.view(
+            SL, self.local_kv_heads, self.model_config.head_dim
+        ).transpose(0, 1)
 
         if self.config.chunk_size > 1:
-            key_states = key_states.view(
+            key_states_loc = key_states_loc.view(
                 self.local_kv_heads, num_chunks, self.config.chunk_size, self.model_config.head_dim
             )
 
-            # if layer_idx == 3:
-            #     print(key_states.shape)
-            #     print(self.landmarks_buffer[layer_idx, batch_index])
-
-            new_landmarks = torch.mean(key_states, dim=2)
+            new_landmarks = torch.mean(key_states_loc, dim=2)
         else:
-            new_landmarks = key_states
+            new_landmarks = key_states_loc
 
         self.landmarks_buffer[layer_idx, batch_index].index_copy_(
             dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
@@ -215,6 +208,7 @@ class ShadowKVPool:
                 self.prefix_end_indices[batch_index] = 0
                 self.suffix_start_indices[batch_index] = 0
                 self.total_num_chunks[batch_index] = 0
+                self.num_chunks_to_select[batch_index] = 0
             else:
                 prefix_idx = math.floor(SL * self.config.prefix_budget)
                 suffix_idx = math.floor(SL - SL * self.config.suffix_budget)
@@ -238,8 +232,10 @@ class ShadowKVPool:
                 + self.num_chunks_to_select[batch_index] * self.config.chunk_size
             )
             logger.info_rank0(
-                f"req {batch_index} SL {SL} -> {pruned_sl} ({100 * pruned_sl / SL:.2f}%)"
+                f"req {batch_index} SL {SL} -> {pruned_sl} ({100 * pruned_sl / SL:.2f}%) {self.prefix_end_indices[batch_index]} {self.suffix_start_indices[batch_index]} {self.num_chunks_to_select[batch_index] * self.config.chunk_size}"
             )
+
+            assert pruned_sl <= SL
 
             no_suffix_pruned_sl = int(
                 self.prefix_end_indices[batch_index]
@@ -344,12 +340,12 @@ class ShadowKVPool:
                 continue
 
             torch.topk(
-                self.scores[i][:, : self.total_num_chunks[batch_idx]],
+                self.scores[i, :, : self.total_num_chunks[batch_idx]],
                 k=num_selected_chunks,
                 sorted=False,
                 out=(
                     self._topk_values_buffer[:, :num_selected_chunks],
-                    self.selected_chunks[batch_idx][:, :num_selected_chunks],
+                    self.selected_chunks[batch_idx, :, :num_selected_chunks],
                 ),
             )
 
@@ -367,7 +363,7 @@ class ShadowKVPool:
             #     )
 
             sparse_indices = (
-                self.selected_chunks[batch_idx][:, :num_selected_chunks] * self.config.chunk_size
+                self.selected_chunks[batch_idx, :, :num_selected_chunks] * self.config.chunk_size
                 + prefix_end
             ).unsqueeze(-1) + self._chunk_size_offset
             sparse_indices = sparse_indices.reshape(

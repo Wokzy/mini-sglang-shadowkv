@@ -50,5 +50,6 @@ def test_shadowkv_score_kernel_gqa_after_score(BS, HC, gqa_factor, num_landmarks
         print(scores)
         print(kernel_res[i])
 
-        assert torch.allclose(kernel_res[i][:, :num_landmarks[batch_idx]], scores, atol=0.00001)
+        assert torch.allclose(kernel_res[i][:, :num_landmarks[batch_idx]], scores, atol=1e-12)
+        # assert torch.allclose(kernel_res[i][:, :num_landmarks[batch_idx]], scores, atol=0.5)
 

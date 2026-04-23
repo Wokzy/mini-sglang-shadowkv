@@ -35,6 +35,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    counter: int = 0
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -42,6 +43,7 @@ class PrefillAdder:
 
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
+        assert handle.cached_len == 0
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -93,16 +95,25 @@ class PrefillAdder:
         if self.token_budget <= 0:
             return None
 
-        if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
-                pending_req=pending_req,
-                cache_handle=chunked_req.cache_handle,
-                table_idx=chunked_req.table_idx,
-                cached_len=chunked_req.cached_len,
-            )
+        # if pending_req.input_len > self.token_budget:
+        #     return None
+
+        if self.counter > 0:
+            return None
+
+        assert not pending_req.chunked_req
+
+        # if chunked_req := pending_req.chunked_req:
+        #     return self._add_one_req(
+        #         pending_req=pending_req,
+        #         cache_handle=chunked_req.cache_handle,
+        #         table_idx=chunked_req.table_idx,
+        #         cached_len=chunked_req.cached_len,
+        #     )
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx = resource
+            self.counter += 1
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,

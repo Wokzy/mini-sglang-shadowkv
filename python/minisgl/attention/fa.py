@@ -73,7 +73,7 @@ class FlashAttentionBackend(BaseAttnBackend):
                 )
 
         # if layer_id == 3:
-        #     print(metadata.cache_seqlens)
+        #     print(metadata.page_table)
 
         return _fa_sgl_impl(
             q=q,  # shape: (BS, num_qo_heads, HD)
