@@ -79,16 +79,6 @@ class ShadowKVPool:
 
         assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
 
-        # self.prefix_end_indices = torch.empty(
-        #     (max_batch_size,), dtype=torch.int32, device='cpu',
-        # ).contiguous()
-        # self.suffix_start_indices = torch.empty(
-        #     (max_batch_size,), dtype=torch.int32, device='cpu',
-        # ).contiguous()
-        # self.num_chunks_to_select = torch.empty(
-        #     (max_batch_size,), dtype=torch.int32, device='cpu',
-        # ).contiguous()
-
         self.prefix_end_indices = [0] * max_batch_size
         self.suffix_start_indices = [0] * max_batch_size
         self.num_chunks_to_select = [0] * max_batch_size
@@ -159,8 +149,6 @@ class ShadowKVPool:
             ],
             dim=0,
         ).to(dtype=torch.int32)
-
-        print(f"{self.imag_page_table=}")
 
     def compute_and_store_landmarks(
         self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int]
@@ -334,7 +322,7 @@ class ShadowKVPool:
 
         # TOPK
         for i in range(BS):
-            batch_idx = self._cpu_batch_indices[i]  # self.batch_indices[i]
+            batch_idx = self._cpu_batch_indices[i]
             num_selected_chunks = self.num_chunks_to_select[batch_idx]
             if num_selected_chunks == 0:
                 continue
@@ -349,18 +337,9 @@ class ShadowKVPool:
                 ),
             )
 
-            # PREPARE INDICES
+            # PREPARE SPARSE INDICES (PREFIX AND SUFFIX ALREADY PREPARED ON PREFILL)
 
             prefix_end = self.prefix_end_indices[batch_idx]
-
-            # Already done on PREFILL
-            # if prefix_end != 0:
-            #     prefix_arange = torch.arange(0, prefix_end, device=self.device)
-            #     self.selected_indices[batch_idx].index_copy_(
-            #         dim=1,
-            #         index=prefix_arange,
-            #         source=prefix_arange.unsqueeze(0).expand(self.local_kv_heads, prefix_end),
-            #     )
 
             sparse_indices = (
                 self.selected_chunks[batch_idx, :, :num_selected_chunks] * self.config.chunk_size
@@ -382,23 +361,6 @@ class ShadowKVPool:
 
             index = prefix_end + num_selected_chunks * self.config.chunk_size
             num_suffix_tokens = self.seqlens[batch_idx] - self.suffix_start_indices[batch_idx]
-
-            # Already done on PREFILL
-            # if num_suffix_tokens != 0:
-            #     suffix_arange = torch.arange(index, index + num_suffix_tokens, device=self.device)
-            #     suffix_index_arange = torch.arange(
-            #         self.suffix_start_indices[batch_idx],
-            #         self.seqlens[batch_idx],
-            #         device=self.device,
-            #     )
-
-            #     self.selected_indices[batch_idx].index_copy_(
-            #         dim=1,
-            #         index=suffix_arange,
-            #         source=suffix_index_arange.unsqueeze(0).expand(
-            #             self.local_kv_heads, num_suffix_tokens
-            #         ),
-            #     )
 
             assert self.num_tokens_to_gather[batch_idx] == index + num_suffix_tokens
 
