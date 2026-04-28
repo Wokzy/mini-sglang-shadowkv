@@ -67,7 +67,7 @@ void set_dequantize_full_params(
     at::Tensor &index,
     at::Tensor &scales,
     at::Tensor &lattice,
-    at::Tensor &add_prediction,
+    // at::Tensor &add_prediction,
     at::Tensor &out
 ) {
     memset(&params, 0, sizeof(params));
@@ -87,7 +87,7 @@ void set_dequantize_full_params(
     params.idx_ptr = index.data_ptr();
     params.scales_ptr = scales.data_ptr();
     params.lattice_ptr = lattice.data_ptr();
-    params.add_ptr = add_prediction.data_ptr();
+    // params.add_ptr = add_prediction.data_ptr();
     params.out_ptr = out.data_ptr();
 }
 
@@ -183,39 +183,40 @@ at::Tensor higgs_quantize_d4_n256(at::Tensor &x, at::Tensor &lattice) {
 }
 
 
-void higgs_dequantize_full(at::Tensor &index, at::Tensor &scales, at::Tensor &lattice, at::Tensor &add_prediction, at::Tensor &out, float hadamard_scale) {
+// void higgs_dequantize_full(at::Tensor &index, at::Tensor &scales, at::Tensor &lattice, at::Tensor &add_prediction, at::Tensor &out, float hadamard_scale) {
+void higgs_dequantize_full(at::Tensor &index, at::Tensor &scales, at::Tensor &lattice, at::Tensor &out, float hadamard_scale) {
     at::ScalarType index_type = index.scalar_type();
     at::ScalarType scales_type = scales.scalar_type();
     at::ScalarType lattice_type = lattice.scalar_type();
-    at::ScalarType add_prediction_type = add_prediction.scalar_type();
+    // at::ScalarType add_prediction_type = add_prediction.scalar_type();
     at::ScalarType out_type = out.scalar_type();
 
     TORCH_CHECK(index_type == at::ScalarType::Byte);
     TORCH_CHECK(scales_type == at::ScalarType::BFloat16);
     TORCH_CHECK(lattice_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(add_prediction_type == at::ScalarType::BFloat16);
+    // TORCH_CHECK(add_prediction_type == at::ScalarType::BFloat16);
     TORCH_CHECK(out_type == at::ScalarType::BFloat16);
     
     TORCH_CHECK(index.is_cuda());
     TORCH_CHECK(scales.is_cuda());
     TORCH_CHECK(lattice.is_cuda());
-    TORCH_CHECK(add_prediction.is_cuda());
+    // TORCH_CHECK(add_prediction.is_cuda());
     TORCH_CHECK(out.is_cuda());
 
     TORCH_CHECK(index.is_contiguous());
-    TORCH_CHECK(add_prediction.is_contiguous());
+    // TORCH_CHECK(add_prediction.is_contiguous());
 
     int n = lattice.size(0);
     int d = lattice.size(1);
 
     TORCH_CHECK(out.dim() == 3);
     TORCH_CHECK(index.dim() == 2);
-    TORCH_CHECK(add_prediction.dim() == 2);
+    // TORCH_CHECK(add_prediction.dim() == 2);
 
     int flattened_batch_size = index.size(0);
     int quantized_channel_size = index.size(1);
 
-    TORCH_CHECK(flattened_batch_size == add_prediction.size(0));
+    // TORCH_CHECK(flattened_batch_size == add_prediction.size(0));
 
     int batch_size = out.size(0);
     int n_tokens = out.size(1);
@@ -229,12 +230,12 @@ void higgs_dequantize_full(at::Tensor &index, at::Tensor &scales, at::Tensor &la
     
     TORCH_CHECK(device_index == lattice.get_device());
     TORCH_CHECK(device_index == scales.get_device());
-    TORCH_CHECK(device_index == add_prediction.get_device());
+    // TORCH_CHECK(device_index == add_prediction.get_device());
     TORCH_CHECK(device_index == out.get_device());
     
     TORCH_CHECK(device == lattice.device());
     TORCH_CHECK(device == scales.device());
-    TORCH_CHECK(device == add_prediction.device());
+    // TORCH_CHECK(device == add_prediction.device());
     TORCH_CHECK(device == out.device());
     
     DequantizeFullParams params;
@@ -249,7 +250,7 @@ void higgs_dequantize_full(at::Tensor &index, at::Tensor &scales, at::Tensor &la
         index,
         scales,
         lattice,
-        add_prediction,
+        // add_prediction,
         out
     );
 

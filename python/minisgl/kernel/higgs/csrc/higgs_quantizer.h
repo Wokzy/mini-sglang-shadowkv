@@ -79,6 +79,6 @@ struct DequantizeFullParams {
     void *__restrict__ idx_ptr;
     void *__restrict__ scales_ptr;
     void *__restrict__ lattice_ptr;
-    void *__restrict__ add_ptr;
+    // void *__restrict__ add_ptr;
     void *__restrict__ out_ptr;
 };

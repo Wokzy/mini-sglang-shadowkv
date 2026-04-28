@@ -63,5 +63,5 @@ class HiggsQuantizerCUDA:
 
         return x
 
-    def full_dequantize(self, quantized: QuantizedTensor, add: torch.Tensor, out: torch.Tensor):
-        higgs_dequantize_full(quantized, self.grid[str(add.device)], add, out, self.hadamard_scale)
+    def full_dequantize(self, quantized: QuantizedTensor, out: torch.Tensor):
+        higgs_dequantize_full(quantized.idx, quantized.scales, self.grid, out, self.hadamard_scale)

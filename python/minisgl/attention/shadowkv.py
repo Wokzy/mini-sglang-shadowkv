@@ -117,10 +117,11 @@ class ShadowKVPool:
             self.landmarks_buffer = torch.empty(
                 (
                     max_batch_size,
-                    self.local_kv_heads,
                     self.max_num_landmarks,
-                    self.model_config.head_dim,
-                )
+                    self.local_kv_heads * self.model_config.head_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
             )
 
         assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
@@ -375,18 +376,31 @@ class ShadowKVPool:
         if not self.config.quantize_landmarks:
             landmarks = self.landmarks_buffer[layer_idx]
         else:
-            dequantized_landmarks = self.landmark_quantizer.dequantize(
-                QuantizedTensor(
-                    idx=self.quantized_landmarks_buffer[layer_idx].view(
-                        self.max_batch_size * self.max_num_landmarks,
-                        self.local_kv_heads * self.model_config.head_dim // self.edenn_d,
-                    ),
-                    scales=self.quantized_landmarks_scales[layer_idx].view(
-                        self.max_batch_size * self.max_num_landmarks,
-                    ),
-                )
+            quant_tensor = QuantizedTensor(
+                idx=self.quantized_landmarks_buffer[layer_idx].view(
+                    self.max_batch_size * self.max_num_landmarks,
+                    self.local_kv_heads * self.model_config.head_dim // self.edenn_d,
+                ),
+                scales=self.quantized_landmarks_scales[layer_idx].view(
+                    self.max_batch_size * self.max_num_landmarks,
+                ),
             )
-            landmarks = dequantized_landmarks.view(
+            # dequantized_landmarks = self.landmark_quantizer.dequantize(
+            #     quant_tensor
+            # )
+            # landmarks = dequantized_landmarks.view(
+            #     self.max_batch_size,
+            #     self.max_num_landmarks,
+            #     self.local_kv_heads,
+            #     self.model_config.head_dim,
+            # ).transpose(1, 2)
+
+            self.landmark_quantizer.full_dequantize(
+                quant_tensor,
+                self.landmarks_buffer,
+            )
+
+            landmarks = self.landmarks_buffer.view(
                 self.max_batch_size,
                 self.max_num_landmarks,
                 self.local_kv_heads,

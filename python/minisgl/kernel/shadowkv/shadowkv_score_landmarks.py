@@ -56,16 +56,13 @@ def shadowkv_score_landmarks_kernel_hd128(
     BS, HD = len(batch_indices), 128
 
     query_states = query_states.contiguous()
-    landmarks = landmarks.contiguous()
-    assert query_states.is_contiguous()
+    assert landmarks.stride(-1) == 1
+
     assert query_states.shape == (BS, local_kv_heads, 1, HD), (
         query_states.shape,
         (BS, local_kv_heads, 1, HD),
     )
 
-    # scores = torch.empty(
-    #     (BS, local_kv_heads, max_num_chunks), dtype=dtype, device=device
-    # ).contiguous()
     grid = lambda meta: (BS, local_kv_heads, max_num_chunks)
 
     __shadowkv_score_landmarks_kernel_triton[grid](
