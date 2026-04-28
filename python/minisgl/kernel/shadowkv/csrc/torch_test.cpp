@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+void init_higgs_lib(py::module &);
+
 void fill_ones(at::Tensor x) {
     TORCH_CHECK(x.scalar_type() == at::ScalarType::Float);
     float* ptr = (float*)x.data_ptr();
@@ -12,5 +14,6 @@ void fill_ones(at::Tensor x) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    init_higgs_lib(m);
     m.def("fill_ones", &fill_ones, "fill_ones");
 }
