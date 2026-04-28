@@ -26,6 +26,7 @@ class ShadowKVConfig:
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
+    enable_offloading: bool = False
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
@@ -175,6 +176,14 @@ class ShadowKVPool:
             device=self.device,
         ).contiguous()
 
+        if config.enable_offloading:
+            self.cpu_kv_buffer = torch.empty(
+                (2, model_config.num_layers, max_batch_size, self.local_kv_heads, max_seq_len, self.model_config.head_dim),
+                dtype=self.dtype,
+                device='cpu',
+                pin_memory=True,
+            )
+
         self.scores = torch.empty(
             (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
             dtype=dtype,
@@ -198,12 +207,32 @@ class ShadowKVPool:
         ).to(dtype=torch.int32)
 
     def compute_and_store_landmarks(
-        self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int]
+        self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int], value_states: torch.Tensor | None = None
     ):
         assert len(batch_indices) == 1
 
         batch_index = batch_indices[0]
         num_chunks = int(self.total_num_chunks[batch_index])
+
+        if self.config.enable_offloading:
+            assert value_states is not None
+            assert key_states.shape[0] == value_states.shape[0]
+
+            sl = key_states.shape[0]
+            cpu_key_states = key_states.cpu().view(sl, self.local_kv_heads, self.model_config.head_dim).transpose(0, 1)
+            cpu_value_states = value_states.cpu().view(sl, self.local_kv_heads, self.model_config.head_dim).transpose(0, 1)
+
+            self.cpu_kv_buffer[0, layer_idx, batch_index].index_copy_(
+                dim=0,
+                index=torch.arange(sl, device='cpu'),
+                source=cpu_key_states
+            )
+
+            self.cpu_kv_buffer[1, layer_idx, batch_index].index_copy_(
+                dim=0,
+                index=torch.arange(sl, device='cpu'),
+                source=cpu_value_states
+            )
 
         if num_chunks == 0:
             return
@@ -466,17 +495,35 @@ class ShadowKVPool:
             #     print(self.selected_indices[batch_idx, :, : index + num_suffix_tokens])
 
         # GATHER
-        shadowkv_gather_kv_cache_kernel_hd128(
-            page_table,
-            k_cache,
-            v_cache,
-            self.kv_buffer[0],
-            self.kv_buffer[1],
-            self.local_kv_heads,
-            self.selected_indices,
-            self.num_tokens_to_gather,
-            self.batch_indices[:BS],
-            self.max_seq_len,
-        )
+        if not self.config.enable_offloading:
+            shadowkv_gather_kv_cache_kernel_hd128(
+                page_table,
+                k_cache,
+                v_cache,
+                self.kv_buffer[0],
+                self.kv_buffer[1],
+                self.local_kv_heads,
+                self.selected_indices,
+                self.num_tokens_to_gather,
+                self.batch_indices[:BS],
+                self.max_seq_len,
+            )
+        else:
+            # DOESNT WORK BECAUSE DECODE KV CACHE IS NOT ON CPU
+            cpu_selected_indices = self.selected_indices.cpu().unsqueeze(0).expand(2, **self.selected_indices.shape)
+            gathered_kv_states = torch.empty(
+                (2,
+                self.max_batch_size,
+                self.local_kv_heads,
+                self.max_seq_len,
+                self.model_config.head_dim),
+                dtype=self.dtype,
+                device='cpu',
+                pin_memory=True
+            )
+
+            torch.gather(self.cpu_kv_buffer[:, layer_idx], dim=3, index=cpu_selected_indices, out=gathered_kv_states)
+
+            gathered_kv_states = gathered_kv_states.to(device=self.device).transpose(2, 3)
 
         return self.kv_buffer[0], self.kv_buffer[1]

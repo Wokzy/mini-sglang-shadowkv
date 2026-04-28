@@ -64,7 +64,11 @@ class Engine:
 
         assert config.page_size == 1
 
+        self.offloading_enabled = False
         if config.shadowkv_config is not None and config.shadowkv_config.enabled:
+            if config.shadowkv_config.enable_offloading:
+                self.offloading_enabled = True
+
             self.ctx.shadowkv_pool = ShadowKVPool(
                 config=config.shadowkv_config,
                 model_config=config.model_config,

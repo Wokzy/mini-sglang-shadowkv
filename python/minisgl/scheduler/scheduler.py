@@ -203,7 +203,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
+        
+        if not (batch.is_prefill and self.engine.offloading_enabled):
+            self.cache_manager.allocate_paged(batch.reqs)
+
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)

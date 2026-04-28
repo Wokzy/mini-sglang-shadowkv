@@ -26,9 +26,10 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
     ) -> None:
         tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        self.local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        self.head_dim = head_dim
         self._kv_buffer = torch.empty(
-            (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
+            (2, num_layers, num_pages, page_size, self.local_kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
@@ -40,7 +41,7 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, self.local_kv_heads, head_dim)
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]

@@ -53,15 +53,25 @@ class FlashAttentionBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        k_cache = self.kvcache.k_cache(layer_id)
-        v_cache = self.kvcache.v_cache(layer_id)
+        offloading_prefill = (batch.is_prefill and self.shadowkv_enabled and self.shadowkv_pool.config.enable_offloading)
+
+        fake_page_table = None
+        if not offloading_prefill:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+
+            k_cache = self.kvcache.k_cache(layer_id)
+            v_cache = self.kvcache.v_cache(layer_id)
+        else:
+            k_cache = k.view(k.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
+            v_cache = v.view(k.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
+
+            fake_page_table = torch.arange(k.shape[0], device=k_cache.device)
 
         if self.shadowkv_enabled:  # TODO (@Wokzy): ensure chunked-prefill is disabled!
             if batch.is_prefill:
                 self.shadowkv_pool.compute_and_store_landmarks(
-                    k, layer_id, [req.table_idx for req in batch.padded_reqs]
+                    k, layer_id, [req.table_idx for req in batch.padded_reqs], v
                 )
             else:
                 k_cache, v_cache = self.shadowkv_pool.select_kv(
@@ -79,7 +89,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             q=q,  # shape: (BS, num_qo_heads, HD)
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=metadata.page_table if not offloading_prefill else fake_page_table,
             cache_seqlens=metadata.cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=metadata.cu_seqlens_k,
