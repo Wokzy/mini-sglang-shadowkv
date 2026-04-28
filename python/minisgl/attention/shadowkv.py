@@ -11,6 +11,8 @@ from minisgl.kernel.shadowkv import (
     shadowkv_gather_kv_cache_kernel_hd128,
 )
 
+from minisgl.quantization.higgs import QuantizedTensor, HiggsQuantizerCUDA
+
 logger = init_logger(__name__)
 
 
@@ -23,6 +25,7 @@ class ShadowKVConfig:
     suffix_budget: float = 0.06125
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
+    quantize_landmarks: bool = False
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
@@ -53,6 +56,7 @@ class ShadowKVPool:
         self.device = device
         self.dtype = dtype
 
+        self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
 
         tp_info = get_tp_info()
@@ -65,17 +69,59 @@ class ShadowKVPool:
 
         assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
 
-        self.landmarks_buffer = torch.empty(
-            (
-                model_config.num_layers,
-                max_batch_size,
-                self.local_kv_heads,
-                self.max_num_landmarks,
-                model_config.head_dim,
-            ),
-            device=device,
-            dtype=dtype,
-        ).contiguous()
+        if not self.config.quantize_landmarks:
+            self.landmarks_buffer = torch.empty(
+                (
+                    model_config.num_layers,
+                    max_batch_size,
+                    self.local_kv_heads,
+                    self.max_num_landmarks,
+                    model_config.head_dim,
+                ),
+                device=device,
+                dtype=dtype,
+            ).contiguous()
+        else:
+            self.edenn_d = 4
+            assert (self.local_kv_heads * self.model_config.head_dim % self.edenn_d) == 0
+
+            self.landmark_quantizer = HiggsQuantizerCUDA(
+                self.local_kv_heads * self.model_config.head_dim,
+                edenn_d=self.edenn_d,
+                edenn_n=256,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            self.quantized_landmarks_buffer = torch.zeros(
+                (
+                    self.model_config.num_layers,
+                    max_batch_size,
+                    self.max_num_landmarks,
+                    self.local_kv_heads * self.model_config.head_dim // self.edenn_d,
+                ),
+                dtype=torch.uint8,
+                device=self.device,
+            ).contiguous()
+
+            self.quantized_landmarks_scales = torch.zeros(
+                (
+                    self.model_config.num_layers,
+                    max_batch_size,
+                    self.max_num_landmarks,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+            ).contiguous()
+
+            self.landmarks_buffer = torch.empty(
+                (
+                    max_batch_size,
+                    self.local_kv_heads,
+                    self.max_num_landmarks,
+                    self.model_config.head_dim,
+                )
+            )
 
         assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
 
@@ -156,7 +202,7 @@ class ShadowKVPool:
         assert len(batch_indices) == 1
 
         batch_index = batch_indices[0]
-        num_chunks = self.total_num_chunks[batch_index]
+        num_chunks = int(self.total_num_chunks[batch_index])
 
         if num_chunks == 0:
             return
@@ -181,9 +227,25 @@ class ShadowKVPool:
         else:
             new_landmarks = key_states_loc
 
-        self.landmarks_buffer[layer_idx, batch_index].index_copy_(
-            dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
-        )
+        if not self.config.quantize_landmarks:
+            self.landmarks_buffer[layer_idx, batch_index].index_copy_(
+                dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
+            )
+        else:
+            new_landmarks = new_landmarks.transpose(0, 1)
+            quantized_landmarks = self.landmark_quantizer.quantize(
+                new_landmarks.reshape(num_chunks, self.local_kv_heads * self.model_config.head_dim)
+            )
+            self.quantized_landmarks_buffer[layer_idx, batch_index].index_copy_(
+                dim=0,
+                index=torch.arange(num_chunks, device=self.device),
+                source=quantized_landmarks.idx,
+            )
+            self.quantized_landmarks_scales[layer_idx, batch_index].index_copy_(
+                dim=0,
+                index=torch.arange(num_chunks, device=self.device),
+                source=quantized_landmarks.scales,
+            )
 
         # if layer_idx == 3:
         #     print(self.landmarks_buffer[layer_idx, batch_index])
@@ -310,10 +372,32 @@ class ShadowKVPool:
         # assert mean_query_states.shape == (BS, self.local_kv_heads, 1, HD)
 
         # SCORING
+        if not self.config.quantize_landmarks:
+            landmarks = self.landmarks_buffer[layer_idx]
+        else:
+            dequantized_landmarks = self.landmark_quantizer.dequantize(
+                QuantizedTensor(
+                    idx=self.quantized_landmarks_buffer[layer_idx].view(
+                        self.max_batch_size * self.max_num_landmarks,
+                        self.local_kv_heads * self.model_config.head_dim // self.edenn_d,
+                    ),
+                    scales=self.quantized_landmarks_scales[layer_idx].view(
+                        self.max_batch_size * self.max_num_landmarks,
+                    ),
+                )
+            )
+            landmarks = dequantized_landmarks.view(
+                self.max_batch_size,
+                self.max_num_landmarks,
+                self.local_kv_heads,
+                self.model_config.head_dim,
+            ).transpose(1, 2)
+
         shadowkv_score_landmarks_kernel_hd128(
             self._mean_query_states[:BS],
             self.scores,
-            self.landmarks_buffer[layer_idx],
+            # self.landmarks_buffer[layer_idx],
+            landmarks,
             self.local_kv_heads,
             self.total_num_chunks,
             self.max_num_landmarks,

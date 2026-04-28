@@ -36,6 +36,8 @@ dependencies = [
     "apache-tvm-ffi>=0.1.4",
     "sgl_kernel>=0.3.17.post1",
     "quack-kernels",
+    "tqdm",
+    "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git"
 ]
 
 [project.optional-dependencies]
@@ -59,7 +61,7 @@ package-dir = {"" = "python"}
 where = ["python"]
 
 [tool.setuptools.package-data]
-"*" = ["csrc/**/*"]
+"*" = ["csrc/**/*", "quantization/grids/*"]
 
 [tool.black]
 line-length = 100
@@ -101,19 +103,6 @@ exclude = [
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py", "*_test.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-addopts = [
-    "--strict-markers",
-    "--strict-config",
-    "--cov=minisgl",
-    "--cov-report=term-missing",
-    "--cov-report=html",
 ]
 
 [tool.mypy]
