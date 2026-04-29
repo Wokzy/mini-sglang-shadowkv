@@ -26,21 +26,22 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
     ) -> None:
         tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        self.local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        self.head_dim = head_dim
         self._kv_buffer = torch.empty(
-            (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
+            (2, num_layers, num_pages, page_size, self.local_kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
 
-        print(f'MHA POOL INIT: {num_pages=} {page_size=} {self._kv_buffer.shape}')
+        print(f"MHA POOL INIT: {num_pages=} {page_size=} {self._kv_buffer.shape}")
 
         self._dtype = dtype
         self._num_layers = num_layers
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, self.local_kv_heads, head_dim)
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]
@@ -51,7 +52,6 @@ class MHAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-
         store_cache(
             k_cache=self._k_buffer[layer_id].view(self._storage_shape),
             v_cache=self._v_buffer[layer_id].view(self._storage_shape),

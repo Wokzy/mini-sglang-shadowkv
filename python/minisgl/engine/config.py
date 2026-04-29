@@ -39,14 +39,13 @@ class EngineConfig:
 
     def __post_init__(self):
         if self.additional_config_path is not None:
-            with open(self.additional_config_path, 'r') as f:
+            with open(self.additional_config_path, "r") as f:
                 additional_config_dict = json.load(f)
 
-            print(f'Loaded {additional_config_dict=}')
-
-            if (shadowkv_config_dict := additional_config_dict.get('shadowkv_config', None)) is not None:
+            if (
+                shadowkv_config_dict := additional_config_dict.get("shadowkv_config", None)
+            ) is not None:
                 self.shadowkv_config = ShadowKVConfig.from_dict(shadowkv_config_dict)
-
 
     @cached_property
     def hf_config(self):

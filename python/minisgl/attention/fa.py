@@ -55,8 +55,18 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        k_cache = self.kvcache.k_cache(layer_id)
-        v_cache = self.kvcache.v_cache(layer_id)
+        is_offloding_prefill = (
+            batch.is_prefill
+            and self.shadowkv_enabled
+            and self.shadowkv_pool.config.enable_offloading
+        )
+
+        if is_offloding_prefill:
+            k_cache = k.view(k.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
+            v_cache = v.view(v.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
+        else:
+            k_cache = self.kvcache.k_cache(layer_id)
+            v_cache = self.kvcache.v_cache(layer_id)
 
         if self.shadowkv_enabled:  # TODO (@Wokzy): ensure chunked-prefill is disabled!
             if batch.is_prefill:
@@ -72,14 +82,13 @@ class FlashAttentionBackend(BaseAttnBackend):
                     layer_id,
                 )
 
-        # if layer_id == 3:
-        #     print(metadata.page_table)
-
         return _fa_sgl_impl(
             q=q,  # shape: (BS, num_qo_heads, HD)
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=metadata.page_table
+            if not is_offloding_prefill
+            else self.shadowkv_pool.imag_page_table[:1, : k.shape[0]],
             cache_seqlens=metadata.cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=metadata.cu_seqlens_k,

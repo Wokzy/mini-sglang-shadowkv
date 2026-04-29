@@ -26,12 +26,14 @@ class ShadowKVConfig:
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
+    enable_offloading: bool = False
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
         assert self.total_budget <= 1.0, "Total Budget cannot be greater than 100%"
 
-        logger.info(f"INITTED shadow kv with {self}")
+        if self.enabled:
+            logger.info(f"INITTED shadow kv with {self}")
 
     @classmethod
     def from_dict(cls, config: dict):
