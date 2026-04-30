@@ -8,7 +8,9 @@ setup(
         CUDAExtension(
             name="minisgl.shadowkv_kernels",
             sources=[
-                "python/minisgl/kernel/shadowkv/csrc/torch_test.cpp",
+                "python/minisgl/kernel/shadowkv/csrc/gather_kv_cache.cu",
+                "python/minisgl/kernel/shadowkv/csrc/metadata_kernels.cu",
+                "python/minisgl/kernel/shadowkv/csrc/shadowkv.cpp",
             ],
             # include_dirs=[os.path.abspath("python/minisgl/kernels/shadowkv/csrs/include")],
             extra_compile_args={
