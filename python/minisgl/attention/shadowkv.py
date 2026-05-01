@@ -148,7 +148,7 @@ class ShadowKVPool:
         )
 
         self.kv_buffer = torch.empty(
-            (2, max_batch_size * max_seq_len, 1, self.local_kv_heads, self.model_config.head_dim),
+            (2, max_batch_size, max_seq_len, self.local_kv_heads, self.model_config.head_dim),
             dtype=self.dtype,
             device=self.device,
         ).contiguous()
@@ -344,22 +344,19 @@ class ShadowKVPool:
                 ),
             )
 
-        # gather_kv_cache(
-        #     self.prefix_lens,
-        #     self.infix_lens,
-        #     self.pruned_infix_lens,
-        #     self.batch_indices[:BS],
-        #     self.pruned_seq_lens[:BS],
-        #     self.cu_pruned_seq_lens[: BS + 1],
-        #     self.selected_chunks,
-        #     k_cache,
-        #     v_cache,
-        #     self.kv_buffer[0],
-        #     self.kv_buffer[1],
-        #     self.config.chunk_size,
-        #     page_table,
-        #     self.imag_page_table,
-        # )
+        gather_kv_cache(
+            self.prefix_lens,
+            self.infix_lens,
+            self.pruned_infix_lens,
+            self.batch_indices[:BS],
+            self.pruned_seq_lens[:BS],
+            self.cu_pruned_seq_lens[: BS + 1],
+            self.selected_chunks,
+            self.full_kv_buffer[0, layer_idx],
+            self.full_kv_buffer[1, layer_idx],
+            self.kv_buffer[0],
+            self.kv_buffer[1],
+            self.config.chunk_size,
+        )
 
-        # return self.kv_buffer[0], self.kv_buffer[1]
-        return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]
+        return self.kv_buffer[0], self.kv_buffer[1]

@@ -2,6 +2,7 @@
 
 #include <cassert>
 
+#include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
 namespace yakv {
@@ -84,23 +85,13 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
     const auto& dst_tensor_strides =
         is_key ? params.dst_k_cache_strides : params.dst_v_cache_strides;
 
-    const size_t src_page_idx =
-        params.src_page_table
-            [kv_cache_idx * params.src_page_table_strides[0] +
-             (src_token_idx / params.page_size) *
-                 params.src_page_table_strides[1]];
     const __nv_bfloat16* src_ptr = src_tensor_ptr +
-        src_page_idx * src_tensor_strides[0] +
-        (src_token_idx % params.page_size) * src_tensor_strides[1] +
+        kv_cache_idx * src_tensor_strides[0] +
+        src_token_idx * src_tensor_strides[1] +
         kv_idx * src_tensor_strides[2] + head_offset;
-    const size_t dst_page_idx =
-        params.dst_page_table
-            [batch_idx * params.dst_page_table_strides[0] +
-             (dst_token_idx / params.page_size) *
-                 params.dst_page_table_strides[1]];
     __nv_bfloat16* dst_ptr = dst_tensor_ptr +
-        dst_page_idx * dst_tensor_strides[0] +
-        (dst_token_idx % params.page_size) * dst_tensor_strides[1] +
+        kv_cache_idx * dst_tensor_strides[0] +
+        dst_token_idx * dst_tensor_strides[1] +
         kv_idx * dst_tensor_strides[2] + head_offset;
     int4 thread_data = *reinterpret_cast<const int4*>(src_ptr);
     *reinterpret_cast<int4*>(dst_ptr) = thread_data;
@@ -124,6 +115,7 @@ void gather_kv_cache_launcher(const GatherKVCacheImplParams& params,
       1};
 
   kernel_instance<<<grid_dim, block_dim, 0, stream>>>(params);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace yakv

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <tuple>
 
+#include <c10/cuda/CUDAException.h>
+
 namespace yakv {
 
 namespace {
@@ -77,6 +79,7 @@ __global__ void shadowkv_fill_prefill_state_kernel(
 void fill_prefill_metadata_launcher(const FillPrefillMetadataParams& params,
                                     cudaStream_t stream) {
   shadowkv_fill_prefill_state_kernel<<<1, 128, 0, stream>>>(params);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 namespace {
@@ -99,6 +102,7 @@ __global__ void shadowkv_fill_decode_state_kernel(
 void fill_decode_metadata_launcher(const FillDecodeMetadataParams& params,
                                    cudaStream_t stream) {
   shadowkv_fill_decode_state_kernel<<<1, 1, 0, stream>>>(params);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace yakv

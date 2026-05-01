@@ -32,7 +32,6 @@ struct GatherKVCacheImplParams {
   std::array<size_t, 2> src_page_table_strides;
   int* dst_page_table = nullptr;
   std::array<size_t, 2> dst_page_table_strides;
-  size_t page_size = 0;
   size_t num_sms = 0;
 };
 

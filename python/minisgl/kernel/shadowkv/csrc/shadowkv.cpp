@@ -22,6 +22,7 @@ void fill_prefill_metadata(torch::Tensor prefix_lens, torch::Tensor infix_lens,
           .sparse_chunks_ratio = sparse_chunks_ratio,
           .local_chunks_ratio = local_chunks_ratio,
           .min_seq_len_to_prune = min_seq_len_to_prune,
+          .chunk_len = chunk_len,
           .block_indices = batch_indices.data_ptr<int>(),
           .full_seq_lens = seq_lens.data_ptr<int>(),
           .batch_size = batch_indices.size(0),
@@ -52,9 +53,7 @@ void gather_kv_cache(torch::Tensor prefix_lens, torch::Tensor infix_lens,
                      torch::Tensor cu_pruned_seq_lens,
                      torch::Tensor selected_chunks, torch::Tensor src_k_cache,
                      torch::Tensor src_v_cache, torch::Tensor out_k_cache,
-                     torch::Tensor out_v_cache, size_t chunk_len,
-                     torch::Tensor src_page_table,
-                     torch::Tensor out_page_table) {
+                     torch::Tensor out_v_cache, size_t chunk_len) {
   gather_kv_cache_launcher(
       GatherKVCacheImplParams{
           .src_k_cache = reinterpret_cast<__nv_bfloat16*>(
@@ -99,13 +98,6 @@ void gather_kv_cache(torch::Tensor prefix_lens, torch::Tensor infix_lens,
                   out_v_cache.stride(0), out_v_cache.stride(1),
                   out_v_cache.stride(2), out_v_cache.stride(3),
               },
-          .src_page_table = src_page_table.data_ptr<int>(),
-          .src_page_table_strides = {src_page_table.stride(0),
-                                     src_page_table.stride(1)},
-          .dst_page_table = out_page_table.data_ptr<int>(),
-          .dst_page_table_strides = {out_page_table.stride(0),
-                                     out_page_table.stride(1)},
-          .page_size = src_k_cache.size(1),
           .num_sms =
               at::cuda::getCurrentDeviceProperties()->multiProcessorCount,
       }, c10::cuda::getCurrentCUDAStream());
