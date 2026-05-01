@@ -160,6 +160,7 @@ class FrontendManager:
 
     async def stream_chat_completions(self, uid: int):
         first_chunk = True
+        cnt = 1
         async for ack in self.wait_for_ack(uid):
             delta = {}
             if first_chunk:
@@ -172,7 +173,9 @@ class FrontendManager:
                 "id": f"cmpl-{uid}",
                 "object": "text_completion.chunk",
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
+                "usage": {"completion_tokens": cnt, "prompt_tokens": 1, "total_tokens": 0},
             }
+            cnt += 1
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
             if ack.finished:
