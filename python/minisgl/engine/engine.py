@@ -54,18 +54,12 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        
 
         assert config.page_size == 1
 
         if config.shadowkv_config is not None and config.shadowkv_config.enabled:
-            self.ctx.shadowkv_pool = ShadowKVPool(
+            self.ctx.kv_cache = ShadowKVPool(
                 config=config.shadowkv_config,
                 model_config=config.model_config,
                 max_batch_size=config.max_running_req + 1,
@@ -73,6 +67,15 @@ class Engine:
                 device=self.device,
                 dtype=self.dtype,
             )
+            self.ctx.shadowkv_enabled = True
+        else:
+            self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+            model_config=config.model_config,
+            num_pages=self.num_pages + 1,  # +1 for dummy page
+            page_size=config.page_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages

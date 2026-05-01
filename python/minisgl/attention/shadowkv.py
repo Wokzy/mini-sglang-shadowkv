@@ -9,6 +9,9 @@ from minisgl.utils import div_even, init_logger
 from minisgl.kernel.shadowkv import (
     shadowkv_score_landmarks_kernel_hd128,
 )
+
+from minisgl.kernel import store_cache
+
 from minisgl.shadowkv_kernels import fill_prefill_metadata, fill_decode_metadata, gather_kv_cache
 
 logger = init_logger(__name__)
@@ -48,11 +51,14 @@ class ShadowKVPool:
         if not config.enabled:
             raise RuntimeError("INITTING ShadowKV pool with shadowkv disabled is prohibited!")
 
+        assert config.suffix_budget == 1.0
+
         self.config = config
         self.model_config: ModelConfig = model_config
         self.device = device
         self.dtype = dtype
 
+        self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
 
         tp_info = get_tp_info()
@@ -62,6 +68,7 @@ class ShadowKVPool:
 
         self.max_num_landmarks = max_seq_len // config.chunk_size
         self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
+        self.head_dim = model_config.head_dim
 
         assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
 
@@ -100,6 +107,7 @@ class ShadowKVPool:
         ).contiguous()
 
         self._cpu_batch_indices = [0] * max_batch_size
+        self.seqlens = [0] * max_batch_size
 
         # RUNTIME BUFFERS:
 
@@ -121,10 +129,24 @@ class ShadowKVPool:
             device=self.device,
         ).contiguous()
 
-        self._chunk_size_offset = torch.arange(0, self.config.chunk_size, device=self.device)
-        self._arange_buffer = torch.empty((max_seq_len,), dtype=torch.int64, device=self.device)
-
         assert dtype == torch.bfloat16
+        self.full_kv_buffer = torch.zeros(
+            (
+                2,
+                model_config.num_layers,
+                max_batch_size,
+                max_seq_len,
+                self.local_kv_heads,
+                self.head_dim,
+            ),
+            device=self.device,
+            dtype=self.dtype,
+        ).contiguous()
+
+        logger.info(
+            f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache"
+        )
+
         self.kv_buffer = torch.empty(
             (2, max_batch_size * max_seq_len, 1, self.local_kv_heads, self.model_config.head_dim),
             dtype=self.dtype,
@@ -144,6 +166,43 @@ class ShadowKVPool:
             ],
             dim=0,
         ).to(dtype=torch.int32)
+
+    def store_kv(self, k: torch.Tensor, v: torch.Tensor, batch_indices: list[int], layer_idx: int):
+        indices = None
+
+        if len(batch_indices) == 1 and k.shape[0] > 1:
+            indices = torch.arange(0, k.shape[0]) + (batch_indices[0] * self.max_seq_len)
+            # if layer_idx == 0:
+            # print('PREFILL cache')
+            # print(batch_indices)
+        else:
+            indices = torch.tensor(
+                [
+                    batch_idx * self.max_seq_len + self.seqlens[batch_idx] - 1
+                    for batch_idx in batch_indices
+                ]
+            )
+
+        indices = indices.to(device=self.device, dtype=torch.int32)
+
+        # if layer_idx == 0:
+        #     print(indices)
+
+        store_cache(
+            k_cache=self.full_kv_buffer[0, layer_idx].view(
+                self.max_batch_size * self.max_seq_len,
+                self.local_kv_heads,
+                self.model_config.head_dim,
+            ),
+            v_cache=self.full_kv_buffer[1, layer_idx].view(
+                self.max_batch_size * self.max_seq_len,
+                self.local_kv_heads,
+                self.model_config.head_dim,
+            ),
+            indices=indices,
+            k=k,
+            v=v,
+        )
 
     def compute_and_store_landmarks(
         self, key_states: torch.Tensor, layer_idx: int, batch_indices: list[int]
@@ -228,19 +287,22 @@ class ShadowKVPool:
             self.cu_pruned_seq_lens,
         )
 
+        for i, batch_idx in enumerate(batch_indices):
+            self.seqlens[batch_idx] = seqlens[i]
+
         return (
             self.cu_pruned_seq_lens[: BS + 1],
             max(seqlens),  # TODO: pruned estimate here
             self.pruned_seq_lens[:BS],
-            self.imag_page_table[: BS, : max(seqlens)],
+            self.imag_page_table[:BS, : max(seqlens)],
         )
 
     def select_kv(
         self,
         query_states: torch.Tensor,
-        page_table: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        # page_table: torch.Tensor,
+        # k_cache: torch.Tensor,
+        # v_cache: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
@@ -268,7 +330,7 @@ class ShadowKVPool:
         for i in range(BS):
             batch_idx = self._cpu_batch_indices[i]
             num_selected_chunks = self.num_chunks_to_select[batch_idx]
-            logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
+            # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
             if num_selected_chunks == 0:
                 continue
 
@@ -281,22 +343,23 @@ class ShadowKVPool:
                     self.selected_chunks[batch_idx, :, :num_selected_chunks],
                 ),
             )
-        
-        gather_kv_cache(
-            self.prefix_lens,
-            self.infix_lens,
-            self.pruned_infix_lens,
-            self.batch_indices[:BS],
-            self.pruned_seq_lens[:BS],
-            self.cu_pruned_seq_lens[: BS + 1],
-            self.selected_chunks,
-            k_cache,
-            v_cache,
-            self.kv_buffer[0],
-            self.kv_buffer[1],
-            self.config.chunk_size,
-            page_table,
-            self.imag_page_table,
-        )
 
-        return self.kv_buffer[0], self.kv_buffer[1]
+        # gather_kv_cache(
+        #     self.prefix_lens,
+        #     self.infix_lens,
+        #     self.pruned_infix_lens,
+        #     self.batch_indices[:BS],
+        #     self.pruned_seq_lens[:BS],
+        #     self.cu_pruned_seq_lens[: BS + 1],
+        #     self.selected_chunks,
+        #     k_cache,
+        #     v_cache,
+        #     self.kv_buffer[0],
+        #     self.kv_buffer[1],
+        #     self.config.chunk_size,
+        #     page_table,
+        #     self.imag_page_table,
+        # )
+
+        # return self.kv_buffer[0], self.kv_buffer[1]
+        return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]
