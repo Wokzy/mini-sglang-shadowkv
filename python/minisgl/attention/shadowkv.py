@@ -12,7 +12,12 @@ from minisgl.kernel.shadowkv import (
 
 from minisgl.kernel import store_cache
 
-from minisgl.shadowkv_kernels import fill_prefill_metadata, fill_decode_metadata, gather_kv_cache
+from minisgl.shadowkv_kernels import (
+    fill_prefill_metadata,
+    fill_decode_metadata,
+    gather_kv_cache,
+    map_to_gpu,
+)
 
 logger = init_logger(__name__)
 
@@ -130,18 +135,21 @@ class ShadowKVPool:
         ).contiguous()
 
         assert dtype == torch.bfloat16
-        self.full_kv_buffer = torch.zeros(
-            (
-                2,
-                model_config.num_layers,
-                max_batch_size,
-                max_seq_len,
-                self.local_kv_heads,
-                self.head_dim,
-            ),
-            device=self.device,
-            dtype=self.dtype,
-        ).contiguous()
+        self.full_kv_buffer = map_to_gpu(
+            torch.zeros(
+                (
+                    2,
+                    model_config.num_layers,
+                    max_batch_size,
+                    max_seq_len,
+                    self.local_kv_heads,
+                    self.head_dim,
+                ),
+                # device=self.device,
+                device="cpu",
+                dtype=self.dtype,
+            ).contiguous()
+        )
 
         logger.info(
             f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache"

@@ -103,6 +103,46 @@ void gather_kv_cache(torch::Tensor prefix_lens, torch::Tensor infix_lens,
       }, c10::cuda::getCurrentCUDAStream());
 }
 
+torch::Tensor map_to_gpu(torch::Tensor tensor) {
+  TORCH_CHECK(tensor.device().is_cpu(), "Tensor must be on CPU");
+
+  void* base_ptr = tensor.storage().data_ptr().get();
+  size_t size_bytes = tensor.storage().nbytes();
+
+  cudaError_t err =
+      cudaHostRegister(base_ptr, size_bytes, cudaHostRegisterMapped);
+
+  bool needs_unregister = false;
+  if (err == cudaSuccess) {
+    needs_unregister = true;
+  } else if (err == cudaErrorHostMemoryAlreadyRegistered) {
+    cudaGetLastError();
+  } else {
+    TORCH_CHECK(false, "cudaHostRegister: ", cudaGetErrorString(err));
+  }
+
+  void* data_ptr = tensor.data_ptr();
+
+  torch::Tensor* keep_alive = new torch::Tensor(tensor);
+
+  auto deleter = [keep_alive, base_ptr, needs_unregister](void* /*ptr*/) {
+    if (needs_unregister) {
+      cudaHostUnregister(base_ptr);
+    }
+    delete keep_alive;
+  };
+
+  auto options = torch::TensorOptions()
+                     .dtype(tensor.dtype())
+                     .device(torch::kCUDA)
+                     .layout(tensor.layout());
+
+  torch::Tensor gpu_tensor = torch::from_blob(
+      data_ptr, tensor.sizes(), tensor.strides(), deleter, options);
+
+  return gpu_tensor;
+}
+
 } // namespace yakv
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -111,4 +151,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "fill_prefill_metadata");
   m.def("fill_decode_metadata", &yakv::fill_decode_metadata,
         "fill_decode_metadata");
+  m.def("map_to_gpu", &yakv::map_to_gpu, "map_to_gpu");
 }
