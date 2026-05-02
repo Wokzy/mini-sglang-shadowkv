@@ -56,8 +56,6 @@ class ShadowKVPool:
         if not config.enabled:
             raise RuntimeError("INITTING ShadowKV pool with shadowkv disabled is prohibited!")
 
-        assert config.suffix_budget == 1.0
-
         self.config = config
         self.model_config: ModelConfig = model_config
         self.device = device

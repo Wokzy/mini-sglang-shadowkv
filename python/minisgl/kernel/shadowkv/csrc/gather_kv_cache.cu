@@ -63,7 +63,7 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
             (dst_token_idx - prefix_len) % params.chunk_len;
         const int landmark_idx =
             params.top_landmarks_indices
-                [batch_idx * params.top_landmarks_indices_strides[0] +
+                [kv_cache_idx * params.top_landmarks_indices_strides[0] +
                  kv_idx * params.top_landmarks_indices_strides[1] +
                  top_landmark_idx];
         return prefix_len + landmark_idx * params.chunk_len +
@@ -87,12 +87,12 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
 
     const __nv_bfloat16* src_ptr = src_tensor_ptr +
         kv_cache_idx * src_tensor_strides[0] +
-        src_token_idx * src_tensor_strides[1] +
-        kv_idx * src_tensor_strides[2] + head_offset;
+        src_token_idx * src_tensor_strides[1] + kv_idx * src_tensor_strides[2] +
+        head_offset;
     __nv_bfloat16* dst_ptr = dst_tensor_ptr +
         kv_cache_idx * dst_tensor_strides[0] +
-        dst_token_idx * dst_tensor_strides[1] +
-        kv_idx * dst_tensor_strides[2] + head_offset;
+        dst_token_idx * dst_tensor_strides[1] + kv_idx * dst_tensor_strides[2] +
+        head_offset;
     int4 thread_data = *reinterpret_cast<const int4*>(src_ptr);
     *reinterpret_cast<int4*>(dst_ptr) = thread_data;
   }
