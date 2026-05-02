@@ -54,21 +54,24 @@ void gather_kv_cache(torch::Tensor prefix_lens, torch::Tensor infix_lens,
                      torch::Tensor selected_chunks, torch::Tensor src_k_cache,
                      torch::Tensor src_v_cache, torch::Tensor out_k_cache,
                      torch::Tensor out_v_cache, size_t chunk_len) {
+  const size_t el_size = src_k_cache.element_size();
   gather_kv_cache_launcher(
       GatherKVCacheImplParams{
-          .src_k_cache = reinterpret_cast<__nv_bfloat16*>(
-              src_k_cache.data_ptr<at::BFloat16>()),
+          .src_k_cache = reinterpret_cast<uint8_t*>(src_k_cache.data_ptr()),
           .src_k_cache_strides =
               {
-                  src_k_cache.stride(0), src_k_cache.stride(1),
-                  src_k_cache.stride(2), src_k_cache.stride(3),
+                  src_k_cache.stride(0) * el_size,
+                  src_k_cache.stride(1) * el_size,
+                  src_k_cache.stride(2) * el_size,
+                  src_k_cache.stride(3) * el_size,
               },
-          .src_v_cache = reinterpret_cast<__nv_bfloat16*>(
-              src_v_cache.data_ptr<at::BFloat16>()),
+          .src_v_cache = reinterpret_cast<uint8_t*>(src_v_cache.data_ptr()),
           .src_v_cache_strides =
               {
-                  src_v_cache.stride(0), src_v_cache.stride(1),
-                  src_v_cache.stride(2), src_v_cache.stride(3),
+                  src_v_cache.stride(0) * el_size,
+                  src_v_cache.stride(1) * el_size,
+                  src_v_cache.stride(2) * el_size,
+                  src_v_cache.stride(3) * el_size,
               },
           .top_landmarks_indices = selected_chunks.data_ptr<int64_t>(),
           .top_landmarks_indices_strides = {selected_chunks.stride(0),
@@ -77,26 +80,28 @@ void gather_kv_cache(torch::Tensor prefix_lens, torch::Tensor infix_lens,
           .batch_size = pruned_seq_lens.size(0),
           .num_kv_heads = src_k_cache.size(2),
           .chunk_len = chunk_len,
-          .head_size = src_k_cache.size(3),
+          .head_size_bytes = src_k_cache.size(3) * el_size,
           .prefix_lens = prefix_lens.data_ptr<int>(),
           .infix_lens = infix_lens.data_ptr<int>(),
           .pruned_infix_lens = pruned_infix_lens.data_ptr<int>(),
           .pruned_seq_lens = pruned_seq_lens.data_ptr<int>(),
           .cu_pruned_seq_lens = cu_pruned_seq_lens.data_ptr<int>(),
           .block_indices = batch_indices.data_ptr<int>(),
-          .dst_k_cache = reinterpret_cast<__nv_bfloat16*>(
-              out_k_cache.data_ptr<at::BFloat16>()),
+          .dst_k_cache = reinterpret_cast<uint8_t*>(out_k_cache.data_ptr()),
           .dst_k_cache_strides =
               {
-                  out_k_cache.stride(0), out_k_cache.stride(1),
-                  out_k_cache.stride(2), out_k_cache.stride(3),
+                  out_k_cache.stride(0) * el_size,
+                  out_k_cache.stride(1) * el_size,
+                  out_k_cache.stride(2) * el_size,
+                  out_k_cache.stride(3) * el_size,
               },
-          .dst_v_cache = reinterpret_cast<__nv_bfloat16*>(
-              out_v_cache.data_ptr<at::BFloat16>()),
+          .dst_v_cache = reinterpret_cast<uint8_t*>(out_v_cache.data_ptr()),
           .dst_v_cache_strides =
               {
-                  out_v_cache.stride(0), out_v_cache.stride(1),
-                  out_v_cache.stride(2), out_v_cache.stride(3),
+                  out_v_cache.stride(0) * el_size,
+                  out_v_cache.stride(1) * el_size,
+                  out_v_cache.stride(2) * el_size,
+                  out_v_cache.stride(3) * el_size,
               },
           .num_sms =
               at::cuda::getCurrentDeviceProperties()->multiProcessorCount,

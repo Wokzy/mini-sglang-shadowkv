@@ -132,7 +132,6 @@ class ShadowKVPool:
             device=self.device,
         ).contiguous()
 
-        assert dtype == torch.bfloat16
         self.full_kv_buffer = map_to_gpu(
             torch.zeros(
                 (
