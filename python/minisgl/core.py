@@ -103,8 +103,8 @@ class Context:
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
-    kv_cache: BaseKVCachePool = field(init=False)
-    shadowkv_pool: Any = field(default=None, init=False) # TODO (@Wokzy) fix typing
+    kv_cache: Any = field(init=False) # TODO (@Wokzy) fix typing
+    shadowkv_enabled: bool = field(default=False, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

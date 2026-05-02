@@ -13,6 +13,8 @@ from .utils import BaseCaptureData
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
+from flash_attn_interface import flash_attn_with_kvcache as flash3_kvcache_impl
+
 
 @dataclass
 class FACaptureData(BaseCaptureData):
@@ -28,6 +30,7 @@ class FAMetadata(BaseAttnMetadata):
     max_seqlen_q: int
 
     page_table: torch.Tensor
+    cache_batch_idx: torch.Tensor
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -45,50 +48,67 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.scale = config.head_dim**-0.5
         self.version = 4 if is_sm100_supported() else 3
 
-        self.shadowkv_enabled = ctx.shadowkv_pool is not None
-        self.shadowkv_pool = ctx.shadowkv_pool
+        self.shadowkv_enabled = ctx.shadowkv_enabled
+
+    def flash3_kvcache_forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+    ):
+        metadata: FAMetadata = batch.attn_metadata
+        batch_indices = [req.table_idx for req in batch.padded_reqs]
+        self.kvcache.store_kv(k, v, batch_indices, layer_id)
+
+        if batch.is_prefill:
+            q_flash = q.view(1, q.shape[0], self.config.num_qo_heads, self.config.head_dim)
+        else:
+            q_flash = q.view(len(batch_indices), 1, self.config.num_qo_heads, self.config.head_dim)
+
+        cache_batch_idx = metadata.cache_batch_idx
+        if batch.is_prefill:
+            cache_batch_idx = torch.Tensor([0]).to(
+                device=self.kvcache.device, dtype=torch.int32, non_blocking=True
+            )
+            self.kvcache.compute_and_store_landmarks(k, layer_id, batch_indices)
+            k_cache = k.view(1, k.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
+            v_cache = v.view(1, v.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
+        else:
+            k_cache, v_cache = self.kvcache.select_kv(
+                q,
+                layer_id,
+            )
+
+        # if layer_id == 0:
+        #     print(f'{cache_batch_idx=}')
+        # print(k_cache[:metadata.cache_seqlens[0]])
+
+        return flash3_kvcache_impl(
+            q_flash,
+            k_cache,
+            v_cache,
+            cache_seqlens=metadata.cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            causal=True,
+        )
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
+
+        if self.shadowkv_enabled:
+            return self.flash3_kvcache_forward(q, k, v, layer_id, batch)
+
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-
-        is_offloding_prefill = (
-            batch.is_prefill
-            and self.shadowkv_enabled
-            and self.shadowkv_pool.config.enable_offloading
-        )
-
-        if is_offloding_prefill:
-            k_cache = k.view(k.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
-            v_cache = v.view(v.shape[0], 1, self.kvcache.local_kv_heads, self.kvcache.head_dim)
-        else:
-            k_cache = self.kvcache.k_cache(layer_id)
-            v_cache = self.kvcache.v_cache(layer_id)
-
-        if self.shadowkv_enabled:  # TODO (@Wokzy): ensure chunked-prefill is disabled!
-            if batch.is_prefill:
-                self.shadowkv_pool.compute_and_store_landmarks(
-                    k, layer_id, [req.table_idx for req in batch.padded_reqs]
-                )
-            else:
-                k_cache, v_cache = self.shadowkv_pool.select_kv(
-                    q,
-                    get_global_ctx().page_table,
-                    k_cache,
-                    v_cache,
-                    layer_id,
-                )
+        k_cache = self.kvcache.k_cache(layer_id)
+        v_cache = self.kvcache.v_cache(layer_id)
 
         return _fa_sgl_impl(
             q=q,  # shape: (BS, num_qo_heads, HD)
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table
-            if not is_offloding_prefill
-            else self.shadowkv_pool.imag_page_table[:1, : k.shape[0]],
+            if not (self.shadowkv_enabled and batch.is_prefill)
+            else self.kvcache.imag_page_table[:1, : k.shape[0]],
             cache_seqlens=metadata.cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=metadata.cu_seqlens_k,
@@ -129,19 +149,17 @@ class FlashAttentionBackend(BaseAttnBackend):
         if self.page_size > 1:
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
+        batch_indices = [req.table_idx for req in reqs]
         if self.shadowkv_enabled:
-            batch_indices = [req.table_idx for req in reqs]
-            # print(batch_indices)
-            # print([req.table_idx for req in reqs], batch.positions)
             if batch.is_prefill:
-                self.shadowkv_pool.prepare_shadowkv_metadata(seqlens_k, batch_indices)
+                self.kvcache.prepare_shadowkv_metadata(seqlens_k, batch_indices)
             else:
                 (
                     cu_seqlens_k,
                     max_seqlen_k,
                     cache_seqlens,
                     new_page_table,
-                ) = self.shadowkv_pool.prepare_decode_metadata(seqlens_k, batch_indices)
+                ) = self.kvcache.prepare_decode_metadata(seqlens_k, batch_indices)
                 cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
                 cache_seqlens = cache_seqlens.to(device, non_blocking=True)
 
@@ -152,6 +170,9 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
             page_table=new_page_table,
+            cache_batch_idx=torch.Tensor(batch_indices).to(
+                device=self.kvcache.device, dtype=torch.int32, non_blocking=True
+            ),
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
