@@ -76,8 +76,7 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
       }
     }();
 
-    constexpr size_t kPortionSize = HeadSizeBytes / kBytesPerLoad;
-    const size_t head_offset = threadIdx.x * kPortionSize;
+    const size_t head_offset = threadIdx.x * kBytesPerLoad;
 
     const uint8_t* src_tensor_ptr =
         is_key ? params.src_k_cache : params.src_v_cache;
