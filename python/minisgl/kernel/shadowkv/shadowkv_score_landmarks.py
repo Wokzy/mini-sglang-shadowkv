@@ -1,3 +1,4 @@
+import math
 import torch
 
 import triton
@@ -17,29 +18,31 @@ def __shadowkv_score_landmarks_kernel_triton(
     batch_indices,
     batch_indices_stride,
     HD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     All buffers must be contiguous.
     """
     pid_x, pid_y, pid_z = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    sl_ptr = tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * pid_z
 
     batch_index = tl.load(batch_indices + pid_x * batch_indices_stride[0])
-    mask = pid_z < tl.load(num_chunks + batch_index * num_chunks_stride[0])
+    mask = sl_ptr < tl.load(num_chunks + batch_index * num_chunks_stride[0])
 
     query_ptr = query_states + pid_x * query_states_stride[0] + pid_y * query_states_stride[1]
     landmark_ptr = (
         landmarks
         + batch_index * landmarks_stride[0]
         + pid_y * landmarks_stride[1]
-        + pid_z * landmarks_stride[2]
+        + sl_ptr[None, :] * landmarks_stride[2]
     )
-    score_ptr = scores + pid_x * scores_stride[0] + pid_y * scores_stride[1] + pid_z
+    score_ptr = scores + pid_x * scores_stride[0] + pid_y * scores_stride[1] + sl_ptr[None, :]
 
     offsets = tl.arange(0, HD)
-    x = tl.load(query_ptr + offsets, mask=mask)
-    y = tl.load(landmark_ptr + offsets, mask=mask)
+    x = tl.load(query_ptr + offsets[None, :])
+    y = tl.load(landmark_ptr + offsets[:, None], mask=mask[None, :])
 
-    tl.store(score_ptr, tl.sum(x * y), mask=mask)
+    tl.store(score_ptr, tl.dot(x, y), mask=mask[None, :])
 
 
 def shadowkv_score_landmarks_kernel_hd128(
@@ -63,7 +66,7 @@ def shadowkv_score_landmarks_kernel_hd128(
         (BS, local_kv_heads, 1, HD),
     )
 
-    grid = lambda meta: (BS, local_kv_heads, max_num_chunks)
+    grid = lambda meta: (BS, local_kv_heads, math.ceil(max_num_chunks / meta['BLOCK_SIZE']))
 
     __shadowkv_score_landmarks_kernel_triton[grid](
         query_states,
@@ -77,6 +80,7 @@ def shadowkv_score_landmarks_kernel_hd128(
         batch_indices,
         batch_indices.stride(),
         HD=HD,
+        BLOCK_SIZE=64
     )
 
     # scores *= (HD ** -.5)

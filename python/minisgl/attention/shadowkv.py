@@ -147,7 +147,7 @@ class ShadowKVPool:
                 ),
                 dtype=self.dtype,
                 device=self.device,
-            )
+            ).contiguous()
 
             logger.info(
                 f"ShadowkvPool: Allocated {(self.quantized_landmarks_buffer.numel() * self.quantized_landmarks_buffer.element_size()) / 2**30:.2f} GiB for 2-bit Landmarks"
@@ -324,7 +324,7 @@ class ShadowKVPool:
         else:
             new_landmarks = new_landmarks.transpose(0, 1)
             quantized_landmarks = self.landmark_quantizer.quantize(
-                new_landmarks.reshape(num_chunks, self.local_kv_heads * self.model_config.head_dim)
+                new_landmarks.reshape(num_chunks, self.local_kv_heads * self.model_config.head_dim).contiguous()
             )
             self.quantized_landmarks_buffer[layer_idx, batch_index].index_copy_(
                 dim=0,
