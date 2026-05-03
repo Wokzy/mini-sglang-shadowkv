@@ -23,6 +23,10 @@ from minisgl.quantization.higgs import QuantizedTensor, HiggsQuantizerCUDA
 
 logger = init_logger(__name__)
 
+DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+}
 
 @dataclass(frozen=False)
 class ShadowKVConfig:
@@ -35,10 +39,16 @@ class ShadowKVConfig:
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
     enable_offloading: bool = False
+    kv_cache_dtype: str | torch.dtype = 'bf16'
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
         assert self.total_budget <= 1.0, "Total Budget cannot be greater than 100%"
+
+        assert isinstance(self.kv_cache_dtype, str)
+        assert self.kv_cache_dtype in DTYPE_MAP
+
+        self.kv_cache_dtype = DTYPE_MAP[self.kv_cache_dtype]
 
         if self.enabled:
             logger.info(f"INITTED shadow kv with {self}")
@@ -200,12 +210,12 @@ class ShadowKVPool:
                         self.head_dim,
                     ),
                     device="cpu",
-                    dtype=self.dtype,
+                    dtype=self.config.kv_cache_dtype,
                 ).contiguous()
             )
 
             logger.info(
-                f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache on CPU"
+                f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache on CPU ({self.full_kv_buffer.dtype})"
             )
         else:
             self.full_kv_buffer = torch.empty(
@@ -218,16 +228,16 @@ class ShadowKVPool:
                     self.head_dim,
                 ),
                 device=self.device,
-                dtype=self.dtype,
+                dtype=self.config.kv_cache_dtype,
             ).contiguous()
 
             logger.info(
-                f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache on GPU"
+                f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache on GPU ({self.full_kv_buffer.dtype})"
             )
 
         self.kv_buffer = torch.empty(
             (2, max_batch_size, max_seq_len, self.local_kv_heads, self.model_config.head_dim),
-            dtype=self.dtype,
+            dtype=self.config.kv_cache_dtype,
             device=self.device,
         ).contiguous()
 
@@ -250,9 +260,6 @@ class ShadowKVPool:
 
         if len(batch_indices) == 1 and k.shape[0] > 1:
             indices = torch.arange(0, k.shape[0]) + (batch_indices[0] * self.max_seq_len)
-            # if layer_idx == 0:
-            # print('PREFILL cache')
-            # print(batch_indices)
         else:
             indices = torch.tensor(
                 [
@@ -261,10 +268,7 @@ class ShadowKVPool:
                 ]
             )
 
-        indices = indices.to(device=self.device, dtype=torch.int32)
-
-        # if layer_idx == 0:
-        #     print(indices)
+        indices = indices.to(device=self.device, dtype=torch.int32, non_blocking=True)
 
         store_cache(
             k_cache=self.full_kv_buffer[0, layer_idx].view(
@@ -278,8 +282,8 @@ class ShadowKVPool:
                 self.model_config.head_dim,
             ),
             indices=indices,
-            k=k,
-            v=v,
+            k=k.to(dtype=self.config.kv_cache_dtype),
+            v=v.to(dtype=self.config.kv_cache_dtype),
         )
 
     def compute_and_store_landmarks(
@@ -445,7 +449,6 @@ class ShadowKVPool:
         shadowkv_score_landmarks_kernel_hd128(
             self._mean_query_states[:BS],
             self.scores,
-            # self.landmarks_buffer[layer_idx],
             landmarks,
             self.local_kv_heads,
             self.total_num_chunks,
@@ -487,3 +490,4 @@ class ShadowKVPool:
         )
 
         return self.kv_buffer[0], self.kv_buffer[1]
+        # return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]

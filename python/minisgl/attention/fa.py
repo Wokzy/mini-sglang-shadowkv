@@ -76,12 +76,8 @@ class FlashAttentionBackend(BaseAttnBackend):
                 layer_id,
             )
 
-        # if layer_id == 0:
-        #     print(f'{cache_batch_idx=}')
-        # print(k_cache[:metadata.cache_seqlens[0]])
-
         return flash3_kvcache_impl(
-            q_flash,
+            q_flash.to(k_cache.dtype),
             k_cache,
             v_cache,
             cache_seqlens=metadata.cache_seqlens,
