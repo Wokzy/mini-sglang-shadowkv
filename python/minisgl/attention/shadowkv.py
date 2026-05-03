@@ -21,6 +21,10 @@ from minisgl.shadowkv_kernels import (
 
 logger = init_logger(__name__)
 
+DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+}
 
 @dataclass(frozen=False)
 class ShadowKVConfig:
@@ -31,12 +35,19 @@ class ShadowKVConfig:
     suffix_budget: float = 0.06125
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
+    kv_cache_dtype: str | torch.dtype = 'bf16'
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
         assert self.total_budget <= 1.0, "Total Budget cannot be greater than 100%"
 
-        logger.info(f"INITTED shadow kv with {self}")
+        assert isinstance(self.kv_cache_dtype, str)
+        assert self.kv_cache_dtype in DTYPE_MAP
+
+        self.kv_cache_dtype = DTYPE_MAP[self.kv_cache_dtype]
+
+        if self.enabled:
+            logger.info(f"INITTED shadow kv with {self}")
 
     @classmethod
     def from_dict(cls, config: dict):
@@ -144,17 +155,17 @@ class ShadowKVPool:
                 ),
                 # device=self.device,
                 device="cpu",
-                dtype=self.dtype,
+                dtype=self.config.kv_cache_dtype,
             ).contiguous()
         )
 
         logger.info(
-            f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache"
+            f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache ({self.full_kv_buffer.dtype})"
         )
 
         self.kv_buffer = torch.empty(
             (2, max_batch_size, max_seq_len, self.local_kv_heads, self.model_config.head_dim),
-            dtype=self.dtype,
+            dtype=self.config.kv_cache_dtype,
             device=self.device,
         ).contiguous()
 
@@ -205,8 +216,8 @@ class ShadowKVPool:
                 self.model_config.head_dim,
             ),
             indices=indices,
-            k=k,
-            v=v,
+            k=k.to(dtype=self.config.kv_cache_dtype),
+            v=v.to(dtype=self.config.kv_cache_dtype),
         )
 
     def compute_and_store_landmarks(
@@ -349,19 +360,20 @@ class ShadowKVPool:
                 ),
             )
 
-        gather_kv_cache(
-            self.prefix_lens,
-            self.infix_lens,
-            self.pruned_infix_lens,
-            self.batch_indices[:BS],
-            self.pruned_seq_lens[:BS],
-            self.cu_pruned_seq_lens[: BS + 1],
-            self.selected_chunks,
-            self.full_kv_buffer[0, layer_idx],
-            self.full_kv_buffer[1, layer_idx],
-            self.kv_buffer[0],
-            self.kv_buffer[1],
-            self.config.chunk_size,
-        )
+        # gather_kv_cache(
+        #     self.prefix_lens,
+        #     self.infix_lens,
+        #     self.pruned_infix_lens,
+        #     self.batch_indices[:BS],
+        #     self.pruned_seq_lens[:BS],
+        #     self.cu_pruned_seq_lens[: BS + 1],
+        #     self.selected_chunks,
+        #     self.full_kv_buffer[0, layer_idx],
+        #     self.full_kv_buffer[1, layer_idx],
+        #     self.kv_buffer[0],
+        #     self.kv_buffer[1],
+        #     self.config.chunk_size,
+        # )
 
-        return self.kv_buffer[0], self.kv_buffer[1]
+        # return self.kv_buffer[0], self.kv_buffer[1]
+        return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]
