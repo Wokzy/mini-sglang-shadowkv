@@ -26,6 +26,7 @@ DTYPE_MAP = {
     "fp8": torch.float8_e4m3fn,
 }
 
+
 @dataclass(frozen=False)
 class ShadowKVConfig:
     enabled: bool = False
@@ -35,7 +36,7 @@ class ShadowKVConfig:
     suffix_budget: float = 0.06125
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
-    kv_cache_dtype: str | torch.dtype = 'bf16'
+    kv_cache_dtype: str | torch.dtype = "bf16"
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
@@ -360,20 +361,19 @@ class ShadowKVPool:
                 ),
             )
 
-        # gather_kv_cache(
-        #     self.prefix_lens,
-        #     self.infix_lens,
-        #     self.pruned_infix_lens,
-        #     self.batch_indices[:BS],
-        #     self.pruned_seq_lens[:BS],
-        #     self.cu_pruned_seq_lens[: BS + 1],
-        #     self.selected_chunks,
-        #     self.full_kv_buffer[0, layer_idx],
-        #     self.full_kv_buffer[1, layer_idx],
-        #     self.kv_buffer[0],
-        #     self.kv_buffer[1],
-        #     self.config.chunk_size,
-        # )
+        gather_kv_cache(
+            self.prefix_lens,
+            self.infix_lens,
+            self.pruned_infix_lens,
+            self.batch_indices[:BS],
+            self.pruned_seq_lens[:BS],
+            self.cu_pruned_seq_lens[: BS + 1],
+            self.selected_chunks,
+            self.full_kv_buffer[0, layer_idx],
+            self.full_kv_buffer[1, layer_idx],
+            self.kv_buffer[0],
+            self.kv_buffer[1],
+            self.config.chunk_size,
+        )
 
-        # return self.kv_buffer[0], self.kv_buffer[1]
-        return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]
+        return self.kv_buffer[0], self.kv_buffer[1]
