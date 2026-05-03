@@ -1,6 +1,7 @@
 #include "gather_kv_cache.cuh"
 
 #include <cassert>
+#include <variant>
 
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
@@ -28,7 +29,9 @@ __device__ __forceinline__ size_t cu_seqlen_upper_bound(const int* cu_seqlens,
   return first;
 }
 
-template <size_t HeadSize>
+constexpr size_t kBytesPerLoad = 16;
+
+template <size_t HeadSizeBytes>
 __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
   for (size_t cur_block_idx = blockIdx.x;
        cur_block_idx < params.cu_pruned_seq_lens[params.batch_size];
@@ -73,24 +76,22 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
       }
     }();
 
-    constexpr size_t portion_size = 8;
-    const size_t head_offset = threadIdx.x * portion_size;
+    constexpr size_t kPortionSize = HeadSizeBytes / kBytesPerLoad;
+    const size_t head_offset = threadIdx.x * kPortionSize;
 
-    const __nv_bfloat16* src_tensor_ptr =
+    const uint8_t* src_tensor_ptr =
         is_key ? params.src_k_cache : params.src_v_cache;
     const auto& src_tensor_strides =
         is_key ? params.src_k_cache_strides : params.src_v_cache_strides;
-    __nv_bfloat16* dst_tensor_ptr =
-        is_key ? params.dst_k_cache : params.dst_v_cache;
+    uint8_t* dst_tensor_ptr = is_key ? params.dst_k_cache : params.dst_v_cache;
     const auto& dst_tensor_strides =
         is_key ? params.dst_k_cache_strides : params.dst_v_cache_strides;
 
-    const __nv_bfloat16* src_ptr = src_tensor_ptr +
+    const uint8_t* src_ptr = src_tensor_ptr +
         kv_cache_idx * src_tensor_strides[0] +
         src_token_idx * src_tensor_strides[1] + kv_idx * src_tensor_strides[2] +
         head_offset;
-    __nv_bfloat16* dst_ptr = dst_tensor_ptr +
-        kv_cache_idx * dst_tensor_strides[0] +
+    uint8_t* dst_ptr = dst_tensor_ptr + kv_cache_idx * dst_tensor_strides[0] +
         dst_token_idx * dst_tensor_strides[1] + kv_idx * dst_tensor_strides[2] +
         head_offset;
     int4 thread_data = *reinterpret_cast<const int4*>(src_ptr);
@@ -98,23 +99,48 @@ __global__ void gather_kv_cache_kernel(GatherKVCacheImplParams params) {
   }
 }
 
+template <size_t... Values>
+std::variant<std::integral_constant<size_t, Values>...> make_size_t_variant(
+    size_t value) {
+  std::variant<std::integral_constant<size_t, Values>...> result;
+  bool found = false;
+  ([&] {
+    if (value == Values) {
+      result.template emplace<std::integral_constant<size_t, Values>>();
+      found = true;
+    }
+  }(), ...);
+  if (!found) {
+    TORCH_CHECK(false, "Invalid mode value provided: ", value);
+  }
+  return result;
+}
+
 } // namespace
 
 void gather_kv_cache_launcher(const GatherKVCacheImplParams& params,
                               cudaStream_t stream) {
-  TORCH_CHECK(params.head_size == 128, "Only head size 128 is supported");
-  auto* kernel_instance = gather_kv_cache_kernel<128>;
-  const dim3 block_dim{128 / 4, static_cast<unsigned int>(params.num_kv_heads),
-                       /* K and V */ 2};
-  int num_blocks = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &num_blocks, kernel_instance, block_dim.x * block_dim.y * block_dim.z, 0);
-  const dim3 grid_dim{
-      static_cast<unsigned>(num_blocks) * static_cast<unsigned>(params.num_sms),
-      1,
-      1};
+  TORCH_CHECK(params.head_size_bytes % kBytesPerLoad == 0,
+              "Only head size aligned by 16 bytes is supported");
+  std::visit([&](auto head_size_bytes_variant) -> void {
+    constexpr size_t kHeadSizeBytes = head_size_bytes_variant.value;
+    auto* kernel_instance = gather_kv_cache_kernel<kHeadSizeBytes>;
 
-  kernel_instance<<<grid_dim, block_dim, 0, stream>>>(params);
+    const dim3 block_dim{kHeadSizeBytes / kBytesPerLoad,
+                         static_cast<unsigned int>(params.num_kv_heads),
+                         /* K and V */ 2};
+    int num_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, kernel_instance, block_dim.x * block_dim.y * block_dim.z,
+        0);
+    const dim3 grid_dim{
+        static_cast<unsigned>(num_blocks) *
+            static_cast<unsigned>(params.num_sms),
+        1,
+        1};
+
+    kernel_instance<<<grid_dim, block_dim, 0, stream>>>(params);
+  }, make_size_t_variant<64, 128, 256>(params.head_size_bytes));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
