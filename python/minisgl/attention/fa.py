@@ -55,7 +55,7 @@ class FlashAttentionBackend(BaseAttnBackend):
     ):
         metadata: FAMetadata = batch.attn_metadata
         batch_indices = [req.table_idx for req in batch.padded_reqs]
-        self.kvcache.store_kv(k, v, batch_indices, layer_id)
+        self.kvcache.store_kv(k, v, layer_id)
 
         if batch.is_prefill:
             q_flash = q.view(1, q.shape[0], self.config.num_qo_heads, self.config.head_dim)
@@ -182,6 +182,8 @@ class FlashAttentionBackend(BaseAttnBackend):
     def prepare_for_capture(self, batch: Batch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
+        batch_indices = [req.table_idx for req in batch.padded_reqs]
+        self.kvcache.prepare_decode_metadata(capture.seq_lens[:bs], batch_indices)
         metadata = FAMetadata(
             cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
@@ -189,6 +191,9 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_k=capture.page_table.size(1) * self.page_size,
             max_seqlen_q=1,  # decode only
             page_table=capture.page_table[:bs, :],
+            cache_batch_idx=torch.Tensor(batch_indices).to(
+                device=self.kvcache.device, dtype=torch.int32, non_blocking=True
+            ),
         )
         batch.attn_metadata = metadata
 

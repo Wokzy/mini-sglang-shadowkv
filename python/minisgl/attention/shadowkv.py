@@ -182,6 +182,8 @@ class ShadowKVPool:
         self._cpu_batch_indices = [0] * max_batch_size
         self.seqlens = [0] * max_batch_size
 
+        self.store_cache_indices = None
+
         # RUNTIME BUFFERS:
 
         self.selected_chunks = torch.empty(
@@ -191,7 +193,7 @@ class ShadowKVPool:
         ).contiguous()
 
         self._topk_values_buffer = torch.empty(
-            (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
+            (self.local_kv_heads, self.max_num_landmarks),
             dtype=self.dtype,
             device=self.device,
         ).contiguous()
@@ -259,21 +261,7 @@ class ShadowKVPool:
             dim=0,
         ).to(dtype=torch.int32)
 
-    def store_kv(self, k: torch.Tensor, v: torch.Tensor, batch_indices: list[int], layer_idx: int):
-        indices = None
-
-        if len(batch_indices) == 1 and k.shape[0] > 1:
-            indices = torch.arange(0, k.shape[0]) + (batch_indices[0] * self.max_seq_len)
-        else:
-            indices = torch.tensor(
-                [
-                    batch_idx * self.max_seq_len + self.seqlens[batch_idx] - 1
-                    for batch_idx in batch_indices
-                ]
-            )
-
-        indices = indices.to(device=self.device, dtype=torch.int32, non_blocking=True)
-
+    def store_kv(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int):
         store_cache(
             k_cache=self.full_kv_buffer[0, layer_idx].view(
                 self.max_batch_size * self.max_seq_len,
@@ -285,7 +273,7 @@ class ShadowKVPool:
                 self.local_kv_heads,
                 self.model_config.head_dim,
             ),
-            indices=indices,
+            indices=self.store_cache_indices,
             k=k.to(dtype=self.config.kv_cache_dtype),
             v=v.to(dtype=self.config.kv_cache_dtype),
         )
@@ -301,7 +289,7 @@ class ShadowKVPool:
         if num_chunks == 0:
             return
 
-        self.scores[batch_index].fill_(float("-inf"))
+        # self.scores[batch_index].fill_(float("-inf"))
 
         key_states_loc = key_states[
             self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
@@ -380,6 +368,8 @@ class ShadowKVPool:
 
         self.max_num_chunks_to_select = max(self.num_chunks_to_select)
 
+        self.store_cache_indices = (torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)).to(device=self.device, dtype=torch.int32, non_blocking=True)
+
     def prepare_decode_metadata(self, seqlens: list[int], batch_indices: list[int]):
         BS = len(batch_indices)
 
@@ -398,8 +388,15 @@ class ShadowKVPool:
             self.cu_pruned_seq_lens,
         )
 
-        for i, batch_idx in enumerate(batch_indices):
-            self.seqlens[batch_idx] = seqlens[i]
+        # for i, batch_idx in enumerate(batch_indices):
+        #     self.seqlens[batch_idx] = seqlens[i]
+
+        self.store_cache_indices = torch.tensor(
+            [
+                batch_idx * self.max_seq_len + seqlens[i] - 1
+                for i, batch_idx in enumerate(batch_indices)
+            ]
+        ).to(device=self.device, dtype=torch.int32, non_blocking=True)
 
         return (
             self.cu_pruned_seq_lens[: BS + 1],
@@ -470,32 +467,32 @@ class ShadowKVPool:
         )
 
         # TOPK
-        # for i in range(BS):
-        #     batch_idx = self._cpu_batch_indices[i]
-        #     num_selected_chunks = self.num_chunks_to_select[batch_idx]
-        #     # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
-        #     if num_selected_chunks == 0:
-        #         continue
+        for i in range(BS):
+            batch_idx = self._cpu_batch_indices[i]
+            num_selected_chunks = self.num_chunks_to_select[batch_idx]
+            # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
+            if num_selected_chunks == 0:
+                continue
 
-        #     torch.topk(
-        #         self.scores[i, :, : self.total_num_chunks[batch_idx]],
-        #         k=num_selected_chunks,
-        #         sorted=False,
-        #         out=(
-        #             self._topk_values_buffer[:, :num_selected_chunks],
-        #             self.selected_chunks[batch_idx, :, :num_selected_chunks],
-        #         ),
-        #     )
+            torch.topk(
+                self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
+                k=num_selected_chunks,
+                sorted=False,
+                out=(
+                    self._topk_values_buffer[:, :num_selected_chunks],
+                    self.selected_chunks[batch_idx, :, :num_selected_chunks],
+                ),
+            )
 
-        torch.topk(
-            self.scores,
-            k=self.max_num_chunks_to_select,
-            sorted=False,
-            out=(
-                self._topk_values_buffer[:, :, : self.max_num_chunks_to_select],
-                self.selected_chunks[:, :, : self.max_num_chunks_to_select],
-            ),
-        )
+        # torch.topk(
+        #     self.scores,
+        #     k=self.max_num_chunks_to_select,
+        #     sorted=False,
+        #     out=(
+        #         self._topk_values_buffer[:, :, : self.max_num_chunks_to_select],
+        #         self.selected_chunks[:, :, : self.max_num_chunks_to_select],
+        #     ),
+        # )
 
         gather_kv_cache(
             self.prefix_lens,
