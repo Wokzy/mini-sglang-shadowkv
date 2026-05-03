@@ -36,7 +36,7 @@ def __shadowkv_score_landmarks_kernel_triton(
         + pid_y * landmarks_stride[1]
         + sl_ptr[None, :] * landmarks_stride[2]
     )
-    score_ptr = scores + pid_x * scores_stride[0] + pid_y * scores_stride[1] + sl_ptr[None, :]
+    score_ptr = scores + batch_index * scores_stride[0] + pid_y * scores_stride[1] + sl_ptr[None, :]
 
     offsets = tl.arange(0, HD)
     x = tl.load(query_ptr + offsets[None, :])
@@ -58,7 +58,7 @@ def shadowkv_score_landmarks_kernel_hd128(
 ) -> None:
     BS, HD = len(batch_indices), 128
 
-    query_states = query_states.contiguous()
+    query_states = query_states.to(landmarks.dtype).contiguous()
     assert landmarks.stride(-1) == 1
 
     assert query_states.shape == (BS, local_kv_heads, 1, HD), (

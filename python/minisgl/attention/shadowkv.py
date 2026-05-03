@@ -28,6 +28,7 @@ DTYPE_MAP = {
     "fp8": torch.float8_e4m3fn,
 }
 
+
 @dataclass(frozen=False)
 class ShadowKVConfig:
     enabled: bool = False
@@ -39,7 +40,8 @@ class ShadowKVConfig:
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
     enable_offloading: bool = False
-    kv_cache_dtype: str | torch.dtype = 'bf16'
+    kv_cache_dtype: str | torch.dtype = "bf16"
+    landmarks_dtype: str | torch.dtype = "bf16"
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
@@ -49,6 +51,7 @@ class ShadowKVConfig:
         assert self.kv_cache_dtype in DTYPE_MAP
 
         self.kv_cache_dtype = DTYPE_MAP[self.kv_cache_dtype]
+        self.landmarks_dtype = DTYPE_MAP[self.landmarks_dtype]
 
         if self.enabled:
             logger.info(f"INITTED shadow kv with {self}")
@@ -100,11 +103,11 @@ class ShadowKVPool:
                     model_config.head_dim,
                 ),
                 device=device,
-                dtype=dtype,
+                dtype=self.config.landmarks_dtype,
             ).contiguous()
 
             logger.info(
-                f"ShadowkvPool: Allocated {(self.landmarks_buffer.numel() * self.landmarks_buffer.element_size()) / 2**30:.2f} GiB for Landmarks"
+                f"ShadowkvPool: Allocated {(self.landmarks_buffer.numel() * self.landmarks_buffer.element_size()) / 2**30:.2f} GiB for Landmarks ({self.config.landmarks_dtype})"
             )
         else:
             self.edenn_d = 4
@@ -167,6 +170,7 @@ class ShadowKVPool:
         self.prefix_end_indices = [0] * max_batch_size
         self.suffix_start_indices = [0] * max_batch_size
         self.num_chunks_to_select = [0] * max_batch_size
+        self.max_num_chunks_to_select = 0
 
         self.total_num_chunks = torch.empty(
             (max_batch_size,), dtype=torch.int32, device=self.device
@@ -187,7 +191,7 @@ class ShadowKVPool:
         ).contiguous()
 
         self._topk_values_buffer = torch.empty(
-            (self.local_kv_heads, self.max_num_landmarks),
+            (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
             dtype=self.dtype,
             device=self.device,
         ).contiguous()
@@ -297,6 +301,8 @@ class ShadowKVPool:
         if num_chunks == 0:
             return
 
+        self.scores[batch_index].fill_(float("-inf"))
+
         key_states_loc = key_states[
             self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
         ]
@@ -318,13 +324,18 @@ class ShadowKVPool:
             new_landmarks = key_states_loc
 
         if not self.config.quantize_landmarks:
-            self.landmarks_buffer[layer_idx, batch_index].index_copy_(
-                dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
+            self.landmarks_buffer[layer_idx, batch_index, :, :num_chunks].copy_(
+                new_landmarks.to(dtype=self.config.landmarks_dtype)
             )
+            # self.landmarks_buffer[layer_idx, batch_index].index_copy_(
+            #     dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
+            # )
         else:
             new_landmarks = new_landmarks.transpose(0, 1)
             quantized_landmarks = self.landmark_quantizer.quantize(
-                new_landmarks.reshape(num_chunks, self.local_kv_heads * self.model_config.head_dim).contiguous()
+                new_landmarks.reshape(
+                    num_chunks, self.local_kv_heads * self.model_config.head_dim
+                ).contiguous()
             )
             self.quantized_landmarks_buffer[layer_idx, batch_index].index_copy_(
                 dim=0,
@@ -366,6 +377,8 @@ class ShadowKVPool:
         self.num_chunks_to_select = (
             self.pruned_infix_lens.cpu() // self.config.chunk_size
         ).tolist()
+
+        self.max_num_chunks_to_select = max(self.num_chunks_to_select)
 
     def prepare_decode_metadata(self, seqlens: list[int], batch_indices: list[int]):
         BS = len(batch_indices)
@@ -457,22 +470,32 @@ class ShadowKVPool:
         )
 
         # TOPK
-        for i in range(BS):
-            batch_idx = self._cpu_batch_indices[i]
-            num_selected_chunks = self.num_chunks_to_select[batch_idx]
-            # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
-            if num_selected_chunks == 0:
-                continue
+        # for i in range(BS):
+        #     batch_idx = self._cpu_batch_indices[i]
+        #     num_selected_chunks = self.num_chunks_to_select[batch_idx]
+        #     # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
+        #     if num_selected_chunks == 0:
+        #         continue
 
-            torch.topk(
-                self.scores[i, :, : self.total_num_chunks[batch_idx]],
-                k=num_selected_chunks,
-                sorted=False,
-                out=(
-                    self._topk_values_buffer[:, :num_selected_chunks],
-                    self.selected_chunks[batch_idx, :, :num_selected_chunks],
-                ),
-            )
+        #     torch.topk(
+        #         self.scores[i, :, : self.total_num_chunks[batch_idx]],
+        #         k=num_selected_chunks,
+        #         sorted=False,
+        #         out=(
+        #             self._topk_values_buffer[:, :num_selected_chunks],
+        #             self.selected_chunks[batch_idx, :, :num_selected_chunks],
+        #         ),
+        #     )
+
+        torch.topk(
+            self.scores,
+            k=self.max_num_chunks_to_select,
+            sorted=False,
+            out=(
+                self._topk_values_buffer[:, :, : self.max_num_chunks_to_select],
+                self.selected_chunks[:, :, : self.max_num_chunks_to_select],
+            ),
+        )
 
         gather_kv_cache(
             self.prefix_lens,
