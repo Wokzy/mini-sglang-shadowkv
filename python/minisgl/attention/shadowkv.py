@@ -241,7 +241,7 @@ class ShadowKVPool:
                 f"ShadowkvPool: Allocated {(self.full_kv_buffer.numel() * self.full_kv_buffer.element_size()) / 2**30:.2f} GiB for KV cache on GPU ({self.full_kv_buffer.dtype})"
             )
 
-        self.kv_buffer = torch.empty(
+        self.kv_buffer = torch.zeros(
             (2, max_batch_size, max_seq_len, self.local_kv_heads, self.model_config.head_dim),
             dtype=self.config.kv_cache_dtype,
             device=self.device,
