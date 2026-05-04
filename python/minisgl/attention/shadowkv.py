@@ -247,7 +247,7 @@ class ShadowKVPool:
             device=self.device,
         ).contiguous()
 
-        self.scores = torch.empty(
+        self.scores = torch.zeros(
             (max_batch_size, self.local_kv_heads, self.max_num_landmarks),
             dtype=dtype,
             device=device,
