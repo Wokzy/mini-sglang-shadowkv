@@ -41,7 +41,8 @@ class ShadowKVConfig:
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
     enable_offloading: bool = False
-    gqa_mean_before_scoring: bool = False
+    gqa_mean_before_scoring: bool = True
+    prune_generation: bool = False
     kv_cache_dtype: str | torch.dtype = "bf16"
     landmarks_dtype: str | torch.dtype = "bf16"
 
@@ -54,6 +55,8 @@ class ShadowKVConfig:
 
         self.kv_cache_dtype = DTYPE_MAP[self.kv_cache_dtype]
         self.landmarks_dtype = DTYPE_MAP[self.landmarks_dtype]
+
+        assert not (self.quantize_landmarks and self.prune_generation)
 
         if self.enabled:
             logger.info(f"INITTED shadow kv with {self}")
@@ -84,16 +87,25 @@ class ShadowKVPool:
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
 
+        self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
+
         tp_info = get_tp_info()
         self.local_kv_heads = div_even(
             model_config.num_kv_heads, tp_info.size, allow_replicate=True
         )
+        self.local_qo_heads = self.local_kv_heads * self.gqa_factor
 
         self.max_num_landmarks = max_seq_len // config.chunk_size
-        self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
         self.head_dim = model_config.head_dim
 
         assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
+
+        if self.config.prune_generation:
+            self.sl_to_prune_generaiton = (
+                math.ceil(1 / self.config.sparse_budget) * self.config.chunk_size
+            )
+
+            logger.info(f"{self.sl_to_prune_generaiton=}")
 
         if not self.config.quantize_landmarks:
             self.landmarks_buffer = torch.empty(
@@ -182,7 +194,10 @@ class ShadowKVPool:
         ).contiguous()
 
         self._cpu_batch_indices = [0] * max_batch_size
-        self.seqlens = [0] * max_batch_size
+
+        self._cpu_total_num_chunks = [0] * max_batch_size
+        self.req_to_prune_generation = [False] * max_batch_size
+        self.suffix_lens = [0] * max_batch_size
 
         self.store_cache_indices = None
 
@@ -297,8 +312,6 @@ class ShadowKVPool:
             self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
         ]
         SL = key_states_loc.shape[0]
-        # assert SL > 0, f"{key_states.shape} {batch_indices=} {self.prefix_end_indices[batch_index]} {self.suffix_start_indices[batch_index]}"
-        # print(layer_idx, SL, SL % self.config.chunk_size)
 
         key_states_loc = key_states_loc.view(
             SL, self.local_kv_heads, self.model_config.head_dim
@@ -317,9 +330,6 @@ class ShadowKVPool:
             self.landmarks_buffer[layer_idx, batch_index, :, :num_chunks].copy_(
                 new_landmarks.to(dtype=self.config.landmarks_dtype)
             )
-            # self.landmarks_buffer[layer_idx, batch_index].index_copy_(
-            #     dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
-            # )
         else:
             new_landmarks = new_landmarks.transpose(0, 1)
             quantized_landmarks = self.landmark_quantizer.quantize(
@@ -338,10 +348,10 @@ class ShadowKVPool:
                 source=quantized_landmarks.scales,
             )
 
-        # if layer_idx == 3:
-        #     print(self.landmarks_buffer[layer_idx, batch_index])
-
     def prepare_shadowkv_metadata(self, seqlens: list[int], batch_indices: list[int]):
+        assert len(batch_indices) == 1
+        batch_idx = batch_indices[0]
+
         fill_prefill_metadata(
             self.prefix_lens,
             self.infix_lens,
@@ -358,12 +368,15 @@ class ShadowKVPool:
         )
         self.prefix_end_indices = self.prefix_lens.cpu().tolist()
         self.suffix_start_indices = (self.prefix_lens.cpu() + self.infix_lens.cpu()).tolist()
+        self.suffix_lens[batch_idx] = seqlens[0] - self.suffix_start_indices[batch_idx]
+
         torch.div(
             self.infix_lens,
             self.config.chunk_size,
             rounding_mode="floor",
             out=self.total_num_chunks,
         )
+        self._cpu_total_num_chunks = self.total_num_chunks.cpu().tolist()
         self.num_chunks_to_select = (
             self.pruned_infix_lens.cpu() // self.config.chunk_size
         ).tolist()
@@ -382,6 +395,29 @@ class ShadowKVPool:
             torch.tensor(batch_indices, dtype=torch.int32), non_blocking=True
         )
 
+        if self.config.prune_generation:
+            for i, batch_idx in enumerate(batch_indices):
+                if (
+                    seqlens[i] - self.suffix_start_indices[batch_idx] - self.suffix_lens[batch_idx]
+                ) >= self.sl_to_prune_generaiton:
+                    # print("PRUNING GENERATION")
+
+                    self.suffix_start_indices[batch_idx] += self.sl_to_prune_generaiton
+                    self.infix_lens[batch_idx] += self.sl_to_prune_generaiton
+                    self.pruned_infix_lens[batch_idx] += (
+                        1 * self.config.chunk_size
+                    )  # generation pruning happens when 1 chunk is added according to sparse budget
+                    self.num_chunks_to_select[batch_idx] += 1
+                    self.total_num_chunks[batch_idx] += (
+                        self.sl_to_prune_generaiton // self.config.chunk_size
+                    )
+                    self._cpu_total_num_chunks[batch_idx] += (
+                        self.sl_to_prune_generaiton // self.config.chunk_size
+                    )
+                    self.req_to_prune_generation[batch_idx] = True
+                else:
+                    self.req_to_prune_generation[batch_idx] = False
+
         fill_decode_metadata(
             self.prefix_lens,
             self.infix_lens,
@@ -391,6 +427,16 @@ class ShadowKVPool:
             self.pruned_seq_lens,
             self.cu_pruned_seq_lens,
         )
+
+        # print(
+        #     self.pruned_seq_lens,
+        #     # self.pruned_infix_lens,
+        #     # self.total_num_chunks,
+        #     self._cpu_total_num_chunks,
+        #     # self.num_chunks_to_select,
+        #     self.suffix_start_indices,
+        #     batch_indices
+        # )
 
         # for i, batch_idx in enumerate(batch_indices):
         #     self.seqlens[batch_idx] = seqlens[i]
@@ -412,12 +458,41 @@ class ShadowKVPool:
     def select_kv(
         self,
         query_states: torch.Tensor,
-        # page_table: torch.Tensor,
-        # k_cache: torch.Tensor,
-        # v_cache: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
+
+        if self.config.prune_generation:
+            for i in range(BS):
+                batch_idx = self._cpu_batch_indices[i]
+                if not self.req_to_prune_generation[batch_idx]:
+                    continue
+
+                new_landmarks = torch.mean(
+                    self.full_kv_buffer[
+                        0,
+                        layer_idx,
+                        batch_idx,
+                        self.suffix_start_indices[batch_idx]
+                        - self.sl_to_prune_generaiton : self.suffix_start_indices[batch_idx],
+                    ]
+                    .transpose(0, 1)
+                    .view(
+                        self.local_kv_heads,
+                        self.sl_to_prune_generaiton // self.config.chunk_size,
+                        self.config.chunk_size,
+                        self.head_dim,
+                    ),
+                    dim=2,
+                )
+
+                self.landmarks_buffer[
+                    layer_idx,
+                    batch_idx,
+                    :,
+                    self._cpu_total_num_chunks[batch_idx]
+                    - new_landmarks.shape[1] : self._cpu_total_num_chunks[batch_idx],
+                ].copy_(new_landmarks.to(self.config.landmarks_dtype))
 
         # SCORING
         if not self.config.quantize_landmarks:
@@ -432,15 +507,6 @@ class ShadowKVPool:
                     self.max_batch_size * self.max_num_landmarks,
                 ),
             )
-            # dequantized_landmarks = self.landmark_quantizer.dequantize(
-            #     quant_tensor
-            # )
-            # landmarks = dequantized_landmarks.view(
-            #     self.max_batch_size,
-            #     self.max_num_landmarks,
-            #     self.local_kv_heads,
-            #     self.model_config.head_dim,
-            # ).transpose(1, 2)
 
             self.landmark_quantizer.full_dequantize(
                 quant_tensor,

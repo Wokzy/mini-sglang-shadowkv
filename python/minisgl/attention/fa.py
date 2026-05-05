@@ -58,9 +58,11 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, layer_id)
 
         if batch.is_prefill:
-            q_flash = q.view(1, q.shape[0], self.config.num_qo_heads, self.config.head_dim)
+            q_flash = q.view(1, q.shape[0], self.kvcache.local_qo_heads, self.config.head_dim)
         else:
-            q_flash = q.view(len(batch_indices), 1, self.config.num_qo_heads, self.config.head_dim)
+            q_flash = q.view(
+                len(batch_indices), 1, self.kvcache.local_qo_heads, self.config.head_dim
+            )
 
         cache_batch_idx = metadata.cache_batch_idx
         if batch.is_prefill:
