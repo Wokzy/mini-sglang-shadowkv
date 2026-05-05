@@ -82,16 +82,17 @@ class ShadowKVPool:
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
 
+        assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
+        self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
+
         tp_info = get_tp_info()
         self.local_kv_heads = div_even(
             model_config.num_kv_heads, tp_info.size, allow_replicate=True
         )
+        self.local_qo_heads = self.local_kv_heads * self.gqa_factor
 
         self.max_num_landmarks = max_seq_len // config.chunk_size
-        self.gqa_factor = self.model_config.num_qo_heads // self.model_config.num_kv_heads
         self.head_dim = model_config.head_dim
-
-        assert (self.model_config.num_qo_heads % self.model_config.num_kv_heads) == 0
 
         if not self.config.quantize_landmarks:
             self.landmarks_buffer = torch.empty(
@@ -368,7 +369,9 @@ class ShadowKVPool:
 
         self.max_num_chunks_to_select = max(self.num_chunks_to_select)
 
-        self.store_cache_indices = (torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)).to(device=self.device, dtype=torch.int32, non_blocking=True)
+        self.store_cache_indices = (
+            torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)
+        ).to(device=self.device, dtype=torch.int32, non_blocking=True)
 
     def prepare_decode_metadata(self, seqlens: list[int], batch_indices: list[int]):
         BS = len(batch_indices)
