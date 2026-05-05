@@ -8,6 +8,7 @@ from minisgl.utils import div_even, init_logger
 
 from minisgl.kernel.shadowkv import (
     shadowkv_score_landmarks_kernel_hd128,
+    shadowkv_score_landmarks_kernel_gqa_hd128,
 )
 
 from minisgl.kernel import store_cache
@@ -40,6 +41,7 @@ class ShadowKVConfig:
     min_seqlen_to_prune: int = 512
     quantize_landmarks: bool = False
     enable_offloading: bool = False
+    gqa_mean_before_scoring: bool = False
     kv_cache_dtype: str | torch.dtype = "bf16"
     landmarks_dtype: str | torch.dtype = "bf16"
 
@@ -368,7 +370,9 @@ class ShadowKVPool:
 
         self.max_num_chunks_to_select = max(self.num_chunks_to_select)
 
-        self.store_cache_indices = (torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)).to(device=self.device, dtype=torch.int32, non_blocking=True)
+        self.store_cache_indices = (
+            torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)
+        ).to(device=self.device, dtype=torch.int32, non_blocking=True)
 
     def prepare_decode_metadata(self, seqlens: list[int], batch_indices: list[int]):
         BS = len(batch_indices)
@@ -415,12 +419,6 @@ class ShadowKVPool:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
 
-        torch.mean(
-            query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD),
-            dim=2,
-            out=self._mean_query_states[:BS],
-        )
-
         # SCORING
         if not self.config.quantize_landmarks:
             landmarks = self.landmarks_buffer[layer_idx]
@@ -456,15 +454,33 @@ class ShadowKVPool:
                 self.model_config.head_dim,
             ).transpose(1, 2)
 
-        shadowkv_score_landmarks_kernel_hd128(
-            self._mean_query_states[:BS],
-            self.scores,
-            landmarks,
-            self.local_kv_heads,
-            self.total_num_chunks,
-            self.max_num_landmarks,
-            self.batch_indices[:BS],
-        )
+        if self.config.gqa_mean_before_scoring:
+            torch.mean(
+                query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD),
+                dim=2,
+                out=self._mean_query_states[:BS],
+            )
+
+            shadowkv_score_landmarks_kernel_hd128(
+                self._mean_query_states[:BS],
+                self.scores,
+                landmarks,
+                self.local_kv_heads,
+                self.total_num_chunks,
+                self.max_num_landmarks,
+                self.batch_indices[:BS],
+            )
+        else:
+            shadowkv_score_landmarks_kernel_gqa_hd128(
+                query_states.view(BS, self.local_kv_heads, self.gqa_factor, HD),
+                self.scores,
+                landmarks,
+                self.local_kv_heads,
+                self.total_num_chunks,
+                self.max_num_landmarks,
+                self.batch_indices[:BS],
+                GQA=self.gqa_factor,
+            )
 
         # TOPK
         for i in range(BS):
