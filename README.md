@@ -25,17 +25,20 @@ Also all prerequisites from mini-sglang are required, such as **NVIDIA CUDA Tool
 ### Example:
 ```bash
 python3 -m minisgl \
-    --model-path Qwen3-8B \
+    --model-path Qwen3-30B-A3B-Instruct-2507 \
     --additional-config-path additional_config.json \
-    --max-seq-len-override 16384 \
-    --max-prefill-length 16384 \
+    --memory-ratio 0.2 \
+    --num-pages 10000000 \
+    --max-seq-len-override 131072 \
+    --max-prefill-length 131072 \
     --tp-size 1 \
     --graph 0 \
     --attention-backend fa,fa \
     --max-running-requests 2 \
     --cache-type naive \
     --host "localhost" \
-    --port 6889
+    --port 6888
+
 ```
 
 additional_config.json
