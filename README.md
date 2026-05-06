@@ -1,7 +1,3 @@
-<p align="center">
-<img width="400" src="/assets/logo.png">
-</p>
-
 # YAKV
 
 ## Prerequisites
@@ -10,6 +6,16 @@
    - no cuda graph
    - `--cache-type` naive
    - Model `head-dim` 128
+
+## Installation:
+
+Install from source:
+```bash
+pip install . --no-build-isolation
+```
+
+**Note** that the installation requires flash-attn. Building it from source can take up significant time and memory. Consider using pre-built wheels or images.
+Also all prerequisites from mini-sglang are required, such as **NVIDIA CUDA Toolkit** and etc.
 
 ## Code
    -  YAKV kernels: `python/minisgl/kernel/shadowkv/`
