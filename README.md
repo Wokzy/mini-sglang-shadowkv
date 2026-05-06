@@ -2,20 +2,21 @@
 <img width="400" src="/assets/logo.png">
 </p>
 
-# Shadowkv
+# YAKV
 
-## prerequisites
-   - flash-attention only!
-   - no chunked prefill
+## Prerequisites
+   - `flash_attn` installed
    - page_size == 1
-   - no cuda graph (yet)
-   - --cache-type naive
+   - no cuda graph
+   - `--cache-type` naive
+   - Model `head-dim` 128
 
-### code
-   -  kernels: `python/minisgl/kernel/shadowkv/`
-   -  implementation: `python/minisgl/attention/[shadowkv.py, fa.py]`
+## Code
+   -  YAKV kernels: `python/minisgl/kernel/shadowkv/`
+   -  HIGGS kernels: `python/minisgl/kernel/higgs/`
+   -  Implementation: `python/minisgl/attention/[shadowkv.py, fa.py]`
 
-- Example:
+### Example:
 ```bash
 python3 -m minisgl \
     --model-path Qwen3-8B \
@@ -36,14 +37,32 @@ additional_config.json
 {
    "shadowkv_config": {
       "enabled": true,
-      "chunk_size": 8,
-      "prefix_budget": 0.006125,
-      "sparse_budget": 0.125,
-      "suffix_budget": 0.06125,
-      "min_seqlen_to_prune": 512
+      "min_seqlen_to_prune": 512,
+      "prefix_budget": 0.00625,
+      "sparse_budget": 0.015625,
+      "suffix_budget": 0.00625,
+      "chunk_size": 1,
+      "quantize_landmarks": true,
+      "enable_offloading": true,
+      "landmarks_dtype": "bf16",
+      "kv_cache_dtype": "fp8"
    }
 }
 ```
+
+#### `shadowkv_config` options:
+   - `min_seqlen_to_prune`: requests won't be pruned to less than min_seqlen_to_prune tokens. Make sure it does not clash with your budgets (`min_seqlen_to_prune` must be less or equal to `max_seq_len * total_budget`)
+   - `prefix_budget`: proportion of prefix input tokens that is always gathered
+   - `sparse_budget`: proportion of selected tokens
+   - `suffix_budget`: proportion of suffix input tokens that is always gathered
+   - `chunk_size`: Landmarks chunk size (YAKV proposes chunk size 1)
+   - `quantize_landmarks`: Enable 2-bit HIGGS qunatization of landmarks
+   - `enable_offloading`: weather to offload KV-cache to CPU
+   - `landmarks_dtype`: Allowed values `[bf16, fp8]`. If `quantize_landmarks == false` landmarks will be stored in selected dtype
+   - `kv_cache_dtype`: Allowed values `[bf16, fp8]`
+
+
+
 
 # Mini-SGLang
 
