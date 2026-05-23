@@ -43,6 +43,7 @@ class ShadowKVConfig:
     enable_offloading: bool = False
     gqa_mean_before_scoring: bool = True
     prune_generation: bool = False
+    prune_generation_aware_to_min_seqlen_to_prune: bool = False
     kv_cache_dtype: str | torch.dtype = "bf16"
     landmarks_dtype: str | torch.dtype = "bf16"
 
@@ -397,9 +398,24 @@ class ShadowKVPool:
 
         if self.config.prune_generation:
             for i, batch_idx in enumerate(batch_indices):
-                if (
+                generated_len = (
                     seqlens[i] - self.suffix_start_indices[batch_idx] - self.suffix_lens[batch_idx]
-                ) >= self.sl_to_prune_generaiton:
+                )
+                if generated_len >= self.sl_to_prune_generaiton:
+                    if self.config.prune_generation_aware_to_min_seqlen_to_prune:
+                        pruned_future_len = (
+                            self.pruned_infix_lens[batch_idx] + 1 * self.config.chunk_size
+                            + self.suffix_lens[batch_idx]
+                            + self.prefix_lens[batch_idx]
+                            + generated_len
+                            - self.sl_to_prune_generaiton
+                        )
+                        if pruned_future_len < self.config.min_seqlen_to_prune:
+                            continue
+                        # else:
+                        #     print(f"{batch_idx} {pruned_future_len=}")
+
+
                     # print("PRUNING GENERATION")
 
                     self.suffix_start_indices[batch_idx] += self.sl_to_prune_generaiton
