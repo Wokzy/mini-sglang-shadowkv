@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 from flash_attn_interface import flash_attn_with_kvcache as flash3_kvcache_impl
 
+# from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash3_kvcache_impl
+
 
 @dataclass
 class FACaptureData(BaseCaptureData):
@@ -104,9 +106,11 @@ class FlashAttentionBackend(BaseAttnBackend):
             q=q,  # shape: (BS, num_qo_heads, HD)
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table
-            if not (self.shadowkv_enabled and batch.is_prefill)
-            else self.kvcache.imag_page_table[:1, : k.shape[0]],
+            page_table=(
+                metadata.page_table
+                if not (self.shadowkv_enabled and batch.is_prefill)
+                else self.kvcache.imag_page_table[:1, : k.shape[0]]
+            ),
             cache_seqlens=metadata.cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=metadata.cu_seqlens_k,
@@ -228,15 +232,15 @@ def _fa_sgl_impl(
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
 ) -> torch.Tensor:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
-    except ImportError as e:
-        raise ImportError(
-            "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
-            "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
-        ) from e
+    # try:
+    #     from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    # except ImportError as e:
+    #     raise ImportError(
+    #         "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
+    #         "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
+    #     ) from e
 
-    return flash_attn_with_kvcache(  # type: ignore
+    return flash3_kvcache_impl(  # type: ignore
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -252,5 +256,5 @@ def _fa_sgl_impl(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         causal=causal,
-        ver=version,  # TODO: support FA4 on blackwell
+        # ver=3,  # TODO: support FA4 on blackwell
     )
