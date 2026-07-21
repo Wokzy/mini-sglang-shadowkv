@@ -88,11 +88,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock) LandmarksScoreKernel(
     void *__restrict__ scalesPtr,
     const float *__restrict__ queryPtr,  // hadamard-transformed, hadamard_scale folded in: [batch, n_q, 128] fp32 contiguous
     void *__restrict__ scoresPtr,
-    size_t batchSize,                    // number of queries; landmarks/scales can hold more entries
+    size_t batchSize,                    // number of queries; landmarks/scales/scores hold max_batch entries
     size_t T,
     size_t scoresBatchStride,
     int *__restrict__ cumulativeLengthes,
-    const int *__restrict__ blockIndices, // [batchSize]: kv-cache entry scored by each query
+    const int *__restrict__ blockIndices, // [batchSize]: kv-cache entry scored by each query; also
+                                          // the scores slot written -> values must be distinct
     void *__restrict__ lattice_ptr
 ) {
     constexpr int N = 256;
@@ -242,16 +243,18 @@ __global__ void __launch_bounds__(kThreadsPerBlock) LandmarksScoreKernel(
 	    }
 	}
 
-	// every warp now has its 16 maxes in smem; 16 lanes each do one coalesced 2-byte write.
-	// score index l = tokenInWarp * kNumKVHeads + head, and the output token stride is kNumKVHeads,
-	// so global offset = base + l -> lanes 0..15 hit 16 consecutive bf16 (one coalesced store).
+	// every warp now has its 16 maxes in smem; 16 lanes each do one 2-byte write. Scores are
+	// [max_batch, n_kv, T] and land in the cache slot's row (kvCacheIdx, not batchIdx): each
+	// group of kNTokensPerWarp lanes writes the consecutive scores of one head row, so the
+	// stores coalesce into kNumKVHeads short runs strided by T.
 	__syncwarp();
 	if (lane_id < kScoresPerWarp) {
-	    int tokenInWarp = lane_id / kNumKVHeads;
+	    int headIdx = lane_id / kNTokensPerWarp;
+	    int tokenInWarp = lane_id % kNTokensPerWarp;
 	    int tokenWithinSample = tokenNumberWithinSample + tokenInWarp;
 	    if (tokenWithinSample < T) {  // skip padding tokens
-	        scoresStore[batchIdx * scoresBatchStride + tokenNumberWithinSample * kNumKVHeads + lane_id]
-	            = scoresSmem[warpIdx * kScoresPerWarp + lane_id];
+	        scoresStore[kvCacheIdx * scoresBatchStride + headIdx * T + tokenWithinSample]
+	            = scoresSmem[warpIdx * kScoresPerWarp + tokenInWarp * kNumKVHeads + headIdx];
 	    }
 	}
     }
@@ -319,8 +322,8 @@ void LandmarksScoreImpl(
 		lattice.data_ptr()
 	    );
 	},
-	make_int_variant<24, 32, 64>(n_q_heads),
-	make_int_variant<2, 4, 8>(n_kv_heads));
+	make_int_variant<8, 16, 24, 32, 64>(n_q_heads, "n_q_heads"),  // 8/16: tp4/tp2 shards with replicated kv heads
+	make_int_variant<2, 4, 8>(n_kv_heads, "n_kv_heads"));
     } catch (const std::bad_variant_access& _) {
 	TORCH_CHECK(false, "Unsupported Landmarks configuration: n_kv_head = ", n_kv_heads, " , n_q_heads = ", n_q_heads)
     }

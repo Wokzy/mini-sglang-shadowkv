@@ -22,28 +22,29 @@ def get_2bit_grid(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 
     return grid
 
+
 QuantizedTensor = namedtuple("QuantizedTensor", ["idx", "scales"])
+
 
 def higgs_quantize(x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     return higgs_quantization_cuda.higgs_quantize(x, grid)
 
 
 def higgs_dequantize(quantized: QuantizedTensor, grid: torch.Tensor) -> torch.Tensor:
-    return higgs_quantization_cuda.higgs_dequantize(
-        quantized.idx, 
-        quantized.scales,
-        grid
+    return higgs_quantization_cuda.higgs_dequantize(quantized.idx, quantized.scales, grid)
+
+
+def higgs_dequantize_full(
+    quantized: QuantizedTensor,
+    grid: torch.Tensor,
+    add_prediction: torch.Tensor,
+    out: torch.Tensor,
+    hadamard_scale,
+) -> torch.Tensor:
+    higgs_quantization_cuda.higgs_dequantize_full(
+        quantized.idx, quantized.scales, grid, add_prediction, out, hadamard_scale
     )
 
-def higgs_dequantize_full(quantized: QuantizedTensor, grid: torch.Tensor, add_prediction: torch.Tensor, out: torch.Tensor, hadamard_scale) -> torch.Tensor:
-    higgs_quantization_cuda.higgs_dequantize_full(
-        quantized.idx, 
-        quantized.scales,
-        grid,
-        add_prediction,
-        out,
-        hadamard_scale
-    )
 
 def _cum_lengths(lengths: torch.Tensor, device) -> torch.Tensor:
     lengths = lengths.to(torch.int64)
@@ -53,121 +54,191 @@ def _cum_lengths(lengths: torch.Tensor, device) -> torch.Tensor:
 
 
 def higgs_quantize_heads(
-        x: torch.Tensor,
-        lengths: torch.Tensor,
-        grid: torch.Tensor,
-        # out: tp.Optional[QuantizedTensor] = None,
-        out_idx: tp.Optional[QuantizedTensor] = None,
-        out_scales: tp.Optional[QuantizedTensor] = None,
-        heads_first: bool = False
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    grid: torch.Tensor,
+    out: tp.Optional[QuantizedTensor] = None,
+    heads_first: bool = False,
+    block_indices: tp.Optional[torch.Tensor] = None,
+    layer_idx: tp.Optional[int] = None,
 ) -> QuantizedTensor:
-    # x: [B, padded_T, n_kv_heads, head_dim] bf16 keys ([B, n_kv_heads, padded_T, head_dim] if heads_first).
+    # Prefill kernel. x: [batch_size, padded_T, n_kv_heads, head_dim] bf16 keys
+    # ([batch_size, n_kv_heads, padded_T, head_dim] if heads_first) -- the new requests.
+    # `out` is the whole preallocated kv cache with max_batch_size as the first dim and
+    # max_seq_len as the token dim (may exceed padded_T); sample b is written into cache slot
+    # block_indices[b] (identity by default; values must be distinct -- this is a scatter).
+    # `lengths`: [max_batch_size] int, tokens per cache slot, indexed through block_indices;
+    # padding tokens are skipped, their idx/scales are left untouched. A warp owns a whole
+    # token in this kernel, so lengths need no rounding here (unlike higgs_score).
     # `grid`: [256, 4] for 2-bit or [256, 2] for 4-bit quantization.
-    # `lengths`: [B] int, the true (unrounded) number of tokens per sample; padding tokens are
-    # skipped, their idx/scales are left untouched. A warp owns a whole token in this kernel,
-    # so lengths need no rounding here (unlike higgs_score).
-    # Returns codes [..., head_dim // d] uint8 and per-head norms [...] float32 with the same
-    # first 3 dims as x -- with heads_first=False that is exactly the landmarks format
-    # higgs_score consumes, with heads_first=True the format higgs_dequantize_heads consumes.
+    # Returns codes [max_batch_size, ..., head_dim // d] uint8 and per-head norms float32 --
+    # with heads_first=False that is exactly the landmarks format higgs_score consumes, with
+    # heads_first=True the format higgs_dequantize_heads consumes.
     d = grid.shape[1]
-    cum_lengths = _cum_lengths(lengths, x.device)
+    batch_size = x.shape[0]
 
-    assert out_idx is not None and out_scales is not None
-    # if out_idx is None:
-        # out = QuantizedTensor(
-        #     idx=torch.empty(*x.shape[:3], x.shape[3] // d, dtype=torch.uint8, device=x.device),
-        #     scales=torch.empty(x.shape[:3], dtype=torch.float32, device=x.device),
-        # )
+    out_idx = out.idx
+    out_scales = out.scales
+
+    if layer_idx is not None:
+        out_idx = out_idx[layer_idx]
+        out_scales = out_scales[layer_idx]
+
+    if out is None:
+        assert (
+            block_indices is None
+        ), "cannot infer max_batch_size: pass the preallocated out together with block_indices"
+        out = QuantizedTensor(
+            idx=torch.empty(*x.shape[:3], x.shape[3] // d, dtype=torch.uint8, device=x.device),
+            scales=torch.empty(x.shape[:3], dtype=torch.float32, device=x.device),
+        )
+
+        assert layer_idx is None
+
+    out_idx = out.idx
+    out_scales = out.scales
+
+    if layer_idx is not None:
+        out_idx = out_idx[layer_idx]
+        out_scales = out_scales[layer_idx]
+
+    assert (
+        lengths.shape[0] == out_idx.shape[0]
+    ), f"lengths must be per cache slot: {lengths.shape[0]} != max_batch_size {out_idx.shape[0]}"
+    if block_indices is None:  # identity mapping: a slice replaces the gather
+        block_indices = torch.arange(batch_size, dtype=torch.int32, device=x.device)
+        active_lengths = lengths[:batch_size]
+    else:
+        block_indices = block_indices.to(torch.int32)
+        active_lengths = lengths[block_indices]
+    cum_lengths = _cum_lengths(active_lengths, x.device)
 
     higgs_quantization_cuda.higgs_quantize_heads(
-        x,
-        cum_lengths,
-        grid,
-        out_idx, #out.idx,
-        out_scales, #out.scales,
-        heads_first
+        x, cum_lengths, block_indices, grid, out_idx, out_scales, heads_first
     )
 
-    # return out
+    return out
 
 
 def higgs_dequantize_heads(
-        quantized: QuantizedTensor,
-        lengths: torch.Tensor,
-        grid: torch.Tensor,
-        hadamard_scale: float,
-        out: tp.Optional[torch.Tensor] = None
+    quantized: QuantizedTensor,
+    lengths: torch.Tensor,
+    grid: torch.Tensor,
+    hadamard_scale: float,
+    block_indices: tp.Optional[torch.Tensor] = None,
+    out: tp.Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # Inverse of higgs_quantize_heads(..., heads_first=True) with a [256, 2] (4-bit) grid:
-    # codes [B, n_kv_heads, padded_T, head_dim // 2] + scales [B, n_kv_heads, padded_T]
-    # -> [B, n_kv_heads, padded_T, head_dim] bf16. hadamard_scale should be 1 / head_dim.
-    # Padding tokens (t >= lengths[b]) are skipped, out is left untouched there.
+    # Decode kernel, inverse of higgs_quantize_heads(..., heads_first=True) with a [256, 2]
+    # (4-bit) grid. `quantized` is the whole preallocated kv cache:
+    # codes [max_batch_size, n_kv_heads, max_T, head_dim // 2] + scales
+    # [max_batch_size, n_kv_heads, max_T]. Only batch_size <= max_batch_size requests are
+    # active; out spans the whole cache too ([max_batch_size, n_kv_heads, max_T, head_dim]
+    # bf16) and the dequantized entries land in the same slots:
+    # out[block_indices[b]] = dequant(cache[block_indices[b]]) (identity mapping over all
+    # slots by default; block_indices values must be distinct). Untouched slots keep their
+    # old values. `lengths`: [max_batch_size] int, tokens per cache slot, indexed through
+    # block_indices; padding tokens (t >= lengths[block_indices[b]]) are skipped as well.
+    # hadamard_scale should be 1 / head_dim.
     d = grid.shape[1]
-    cum_lengths = _cum_lengths(lengths, quantized.idx.device)
+    max_batch_size = quantized.idx.shape[0]
+    assert (
+        lengths.shape[0] == max_batch_size
+    ), f"lengths must be per cache slot: {lengths.shape[0]} != max_batch_size {max_batch_size}"
+
+    if block_indices is None:  # identity mapping over the whole cache: a slice replaces the gather
+        block_indices = torch.arange(max_batch_size, dtype=torch.int32, device=quantized.idx.device)
+        active_lengths = lengths
+    else:
+        block_indices = block_indices.to(torch.int32)
+        active_lengths = lengths[block_indices.long()]
+
+    cum_lengths = _cum_lengths(active_lengths, quantized.idx.device)
 
     if out is None:
-        out = torch.empty(*quantized.idx.shape[:3], quantized.idx.shape[3] * d,
-                          dtype=torch.bfloat16, device=quantized.idx.device)
+        out = torch.empty(
+            max_batch_size,
+            *quantized.idx.shape[1:3],
+            quantized.idx.shape[3] * d,
+            dtype=torch.bfloat16,
+            device=quantized.idx.device,
+        )
 
     higgs_quantization_cuda.higgs_dequantize_heads(
-        quantized.idx,
-        quantized.scales,
-        cum_lengths,
-        grid,
-        out,
-        hadamard_scale
+        quantized.idx, quantized.scales, cum_lengths, block_indices, grid, out, hadamard_scale
     )
 
     return out
 
 
 def higgs_score(
-        landmarks: QuantizedTensor,
-        lengths: torch.Tensor,
-        grid: torch.Tensor,
-        query: torch.Tensor,
-        hadamard_scale: float,
-        block_indices: tp.Optional[torch.Tensor] = None,
-        out: tp.Optional[torch.Tensor] = None
+    landmarks: QuantizedTensor,
+    lengths: torch.Tensor,
+    grid: torch.Tensor,
+    query: torch.Tensor,
+    hadamard_scale: float,
+    block_indices: tp.Optional[torch.Tensor] = None,
+    out: tp.Optional[torch.Tensor] = None,
+    layer_idx: tp.Optional[int] = None,
 ) -> torch.Tensor:
-    # landmarks hold the whole kv cache ([kv_cache_size, T, n_kv_heads, ...]); the query batch B
-    # can be smaller. `block_indices`: [B] int, query i scores the tokens of kv-cache entry
-    # block_indices[i] (defaults to the identity mapping). `lengths`: [B] int, the true
-    # (unrounded) number of tokens to score for each query, i.e. the current length of its
-    # cache entry. The kernel needs each query's flattened token range to be a multiple of
-    # tokens-per-warp (so a warp never straddles a query boundary), so we round up here and
-    # pass the cumsum.
+    # Decode kernel. landmarks hold the whole preallocated kv cache
+    # ([max_batch_size, max_T, n_kv_heads, ...]); only batch_size <= max_batch_size requests
+    # are active. `block_indices`: [batch_size] int, query b scores the tokens of kv-cache
+    # entry block_indices[b] (defaults to the identity mapping), and the scores land in the
+    # same slot of out ([max_batch_size, n_kv_heads, max_T] bf16):
+    # out[block_indices[b], h, t] = score of query b -- so block_indices values must be
+    # distinct; untouched slots keep their old values. `lengths`: [max_batch_size] int,
+    # tokens per cache slot, indexed through block_indices. The kernel needs each query's
+    # flattened token range to be a multiple of tokens-per-warp (so a warp never straddles a
+    # query boundary), so we round up here and pass the cumsum.
     if query.ndim == 4:
-        assert query.shape[2] == 1
-        query = query.squeeze(2)
+        assert query.shape[1] == 1
+        query = query.squeeze(1)
+
+    landmarks_idx = landmarks.idx
+    landmarks_scales = landmarks.scales
+
+    if layer_idx is not None:
+        landmarks_idx = landmarks_idx[layer_idx]
+        landmarks_scales = landmarks_scales[layer_idx]
 
     batch_size = query.shape[0]
-    n_kv_heads = landmarks.idx.shape[2]
+    n_kv_heads = landmarks_idx.shape[2]
+    assert (
+        lengths.shape[0] == landmarks_idx.shape[0]
+    ), f"lengths must be per cache slot: {lengths.shape[0]} != max_batch_size {landmarks_idx.shape[0]}"
+
+    if block_indices is None:  # identity mapping: a slice replaces the gather
+        block_indices = torch.arange(batch_size, dtype=torch.int32, device=landmarks_idx.device)
+        lengths = lengths[:batch_size]
+    else:
+        block_indices = block_indices.to(torch.int32)
+        lengths = lengths[block_indices]
+
     # tokens-per-warp = (32 lanes * 16 bytes) / (n_kv_heads * head_dim/d bytes);  head_dim=128, d=4 -> 16 // n_kv
     tokens_per_warp = 16 // n_kv_heads
     lengths = lengths.to(torch.int64)
     rounded = ((lengths + tokens_per_warp - 1) // tokens_per_warp) * tokens_per_warp
-    cum_lengths = torch.zeros(batch_size + 1, dtype=torch.int32, device=landmarks.idx.device)
+    cum_lengths = torch.zeros(batch_size + 1, dtype=torch.int32, device=landmarks_idx.device)
     cum_lengths[1:] = torch.cumsum(rounded, 0).to(torch.int32)
 
-    if block_indices is None:
-        block_indices = torch.arange(batch_size, dtype=torch.int32, device=landmarks.idx.device)
-    else:
-        block_indices = block_indices.to(torch.int32)
-
     if out is None:
-        out = torch.empty(batch_size, landmarks.idx.shape[1], n_kv_heads,
-                          dtype=query.dtype, device=query.device)  # [B, T, n_kv_head] scores
+        out = torch.empty(
+            landmarks_idx.shape[0],
+            n_kv_heads,
+            landmarks_idx.shape[1],
+            dtype=query.dtype,
+            device=query.device,
+        )  # [max_batch, n_kv_head, T] scores
 
     higgs_quantization_cuda.higgs_score(
-        landmarks.idx,
-        landmarks.scales,
+        landmarks_idx,
+        landmarks_scales,
         cum_lengths,
         block_indices,
         grid,
         query,
         out,
-        hadamard_scale
+        hadamard_scale,
     )
 
     return out

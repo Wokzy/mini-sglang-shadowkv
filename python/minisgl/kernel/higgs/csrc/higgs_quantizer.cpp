@@ -9,8 +9,8 @@ void higgs_quantize_d4_n256_cuda(QuantizeParams &params, cudaStream_t stream);
 void higgs_dequantize_d4_n256_cuda(DequantizeParams &params, cudaStream_t stream, int channel_size);
 void higgs_dequantize_d4_n256_full_cuda(DequantizeFullParams &params, cudaStream_t stream);
 void LandmarksScore(at::Tensor &landmarks, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &query, at::Tensor &out, float hadamard_scale);
-void HeadsQuantize(at::Tensor &x, at::Tensor &cum_lengths, at::Tensor &lattice, at::Tensor &idx, at::Tensor &scales, bool heads_first);
-void HeadsDequantize(at::Tensor &idx, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &lattice, at::Tensor &out, float hadamard_scale);
+void HeadsQuantize(at::Tensor &x, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &idx, at::Tensor &scales, bool heads_first);
+void HeadsDequantize(at::Tensor &idx, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &out, float hadamard_scale);
 
 void set_quantize_params(
     QuantizeParams &params,
@@ -267,10 +267,10 @@ void higgs_score_d4_n256(
 	at::Tensor &landmarks, // [kv_cache_size, padded_T, n_kv_heads, head_dim // d]
 	at::Tensor &scales, // [kv_cache_size, padded_T, n_kv_heads]
 	at::Tensor &cum_lengths, // [batch + 1] prefix sums of the (rounded) per-query lengths
-	at::Tensor &block_indices, // [batch]: kv-cache entry scored by each query
+	at::Tensor &block_indices, // [batch]: kv-cache entry scored by each query (also the out slot, values distinct)
 	at::Tensor &lattice, // [256, 4]
 	at::Tensor &query, // [batch, n_q_heads, head_dim]
-	at::Tensor &out, // [batch, padded_T, n_kv_heads] scores
+	at::Tensor &out, // [kv_cache_size, n_kv_heads, padded_T] scores, written at out[block_indices[b]]
 	float hadamard_scale
     ) {
     at::ScalarType index_type = landmarks.scalar_type();
@@ -341,7 +341,8 @@ void higgs_score_d4_n256(
     TORCH_CHECK(cum_lengths.size(0) == b + 1, "cum_lengths.size(0) (", cum_lengths.size(0), ") != b + 1 (", b + 1, ")");
     TORCH_CHECK(cum_lengths.is_contiguous());
 
-    // block_indices: [b] int32; values must be < kv_cache_size (not validated, lives on device)
+    // block_indices: [b] int32; values must be distinct (out is written at out[block_indices[b]])
+    // and < kv_cache_size (neither is validated, lives on device)
     TORCH_CHECK(block_indices.size(0) == b, "block_indices.size(0) (", block_indices.size(0), ") != b (", b, ")");
     TORCH_CHECK(block_indices.is_contiguous());
 
@@ -358,12 +359,12 @@ void higgs_score_d4_n256(
     TORCH_CHECK(query.stride(2) == 1, "query head_dim must be contiguous");
     TORCH_CHECK(query.stride(1) == head_dim, "query heads must be packed (stride(1) == head_dim)");
 
-    // out (scores): [b, t, n_kv_head]; batch stride is passed, inner two dims must be packed
-    TORCH_CHECK(out.size(0) == b, "out.size(0) (", out.size(0), ") != b (", b, ")");
-    TORCH_CHECK(out.size(1) == t, "out.size(1) (", out.size(1), ") != t (", t, ")");
-    TORCH_CHECK(out.size(2) == n_kv_head, "out.size(2) (", out.size(2), ") != n_kv_head (", n_kv_head, ")");
+    // out (scores): [kv_cache_size, n_kv_head, t]; batch stride is passed, inner two dims must be packed
+    TORCH_CHECK(out.size(0) == kv_cache_size, "out.size(0) (", out.size(0), ") != kv_cache_size (", kv_cache_size, ")");
+    TORCH_CHECK(out.size(1) == n_kv_head, "out.size(1) (", out.size(1), ") != n_kv_head (", n_kv_head, ")");
+    TORCH_CHECK(out.size(2) == t, "out.size(2) (", out.size(2), ") != t (", t, ")");
     TORCH_CHECK(out.stride(2) == 1, "out last dim must be contiguous");
-    TORCH_CHECK(out.stride(1) == n_kv_head, "out token stride must be n_kv_head");
+    TORCH_CHECK(out.stride(1) == t, "out head stride must be t");
 
     LandmarksScore(landmarks, scales, cum_lengths, block_indices, lattice, query, out, hadamard_scale);
 }
@@ -371,12 +372,14 @@ void higgs_score_d4_n256(
 void higgs_quantize_heads(
 	at::Tensor &x, // [batch, padded_T, n_kv_heads, head_dim], or [batch, n_kv_heads, padded_T, head_dim] if heads_first
 	at::Tensor &cum_lengths, // [batch + 1] int32 prefix sums of the true lengths
+	at::Tensor &block_indices, // [batch]: cache slot each input sample is written to (must be distinct)
 	at::Tensor &lattice, // [256, 4] (2 bit) or [256, 2] (4 bit)
-	at::Tensor &idx, // codes (out), same first 3 dims as x, last dim head_dim // d
-	at::Tensor &scales, // float norms (out), same first 3 dims as x
+	at::Tensor &idx, // codes (out), the whole kv cache: [max_batch, max_T, n_kv_heads, head_dim // d] (layout like x)
+	at::Tensor &scales, // float norms (out), [max_batch, max_T, n_kv_heads] (layout like x)
 	bool heads_first
     ) {
     at::ScalarType x_type = x.scalar_type();
+    at::ScalarType block_indices_type = block_indices.scalar_type();
     at::ScalarType cum_lengths_type = cum_lengths.scalar_type();
     at::ScalarType lattice_type = lattice.scalar_type();
     at::ScalarType idx_type = idx.scalar_type();
@@ -384,11 +387,13 @@ void higgs_quantize_heads(
 
     TORCH_CHECK(x_type == at::ScalarType::BFloat16);
     TORCH_CHECK(cum_lengths_type == at::ScalarType::Int);
+    TORCH_CHECK(block_indices_type == at::ScalarType::Int);
     TORCH_CHECK(lattice_type == at::ScalarType::BFloat16);
     TORCH_CHECK(idx_type == at::ScalarType::Byte);
     TORCH_CHECK(scales_type == at::ScalarType::Float);
 
     TORCH_CHECK(x.is_cuda());
+    TORCH_CHECK(block_indices.is_cuda());
     TORCH_CHECK(cum_lengths.is_cuda());
     TORCH_CHECK(lattice.is_cuda());
     TORCH_CHECK(idx.is_cuda());
@@ -397,16 +402,19 @@ void higgs_quantize_heads(
     int device_index = x.get_device();
     at::Device device = x.device();
     TORCH_CHECK(device_index == cum_lengths.get_device());
+    TORCH_CHECK(device_index == block_indices.get_device());
     TORCH_CHECK(device_index == lattice.get_device());
     TORCH_CHECK(device_index == idx.get_device());
     TORCH_CHECK(device_index == scales.get_device());
     TORCH_CHECK(device == cum_lengths.device());
+    TORCH_CHECK(device == block_indices.device());
     TORCH_CHECK(device == lattice.device());
     TORCH_CHECK(device == idx.device());
     TORCH_CHECK(device == scales.device());
 
     TORCH_CHECK(x.ndimension() == 4, "x must be 4D, got ", x.ndimension(), "D");
     TORCH_CHECK(cum_lengths.ndimension() == 1);
+    TORCH_CHECK(block_indices.ndimension() == 1);
     TORCH_CHECK(lattice.ndimension() == 2);
     TORCH_CHECK(idx.ndimension() == 4, "idx must be 4D, got ", idx.ndimension(), "D");
     TORCH_CHECK(scales.ndimension() == 3, "scales must be 3D, got ", scales.ndimension(), "D");
@@ -424,34 +432,49 @@ void higgs_quantize_heads(
     TORCH_CHECK(cum_lengths.size(0) == b + 1, "cum_lengths.size(0) (", cum_lengths.size(0), ") != b + 1 (", b + 1, ")");
     TORCH_CHECK(cum_lengths.is_contiguous());
 
+    // block_indices: [b] int32; values must be distinct and < idx.size(0) (not validated, lives on device)
+    TORCH_CHECK(block_indices.size(0) == b, "block_indices.size(0) (", block_indices.size(0), ") != b (", b, ")");
+    TORCH_CHECK(block_indices.is_contiguous());
+
     // lattice: [256, 4] or [256, 2]
     int d = lattice.size(1);
     TORCH_CHECK(lattice.size(0) == 256, "lattice.size(0) must be 256, got ", lattice.size(0));
     TORCH_CHECK(d == 4 || d == 2, "lattice.size(1) must be 4 or 2, got ", d);
     TORCH_CHECK(lattice.is_contiguous());
 
-    // idx: codes, same layout as x with head_dim / d last dim
-    for (int i = 0; i < 3; ++i) {
-        TORCH_CHECK(idx.size(i) == x.size(i), "idx.size(", i, ") (", idx.size(i), ") != x.size(", i, ") (", x.size(i), ")");
-        TORCH_CHECK(scales.size(i) == x.size(i), "scales.size(", i, ") (", scales.size(i), ") != x.size(", i, ") (", x.size(i), ")");
+    // idx/scales are the preallocated kv cache: same layout as x, but the batch dim is
+    // max_batch_size (>= b is not checkable against block_indices values here) and the token
+    // dim is max_seq_len (may exceed x's padding; lengths must fit both)
+    TORCH_CHECK(idx.size(0) == scales.size(0), "idx.size(0) (", idx.size(0), ") != scales.size(0) (", scales.size(0), ")");
+    int n_kv_head = heads_first ? x.size(1) : x.size(2);
+    if (heads_first) {
+        TORCH_CHECK(idx.size(1) == n_kv_head, "idx.size(1) (", idx.size(1), ") != n_kv_head (", n_kv_head, ")");
+        TORCH_CHECK(scales.size(1) == n_kv_head, "scales.size(1) (", scales.size(1), ") != n_kv_head (", n_kv_head, ")");
+        TORCH_CHECK(idx.size(2) == scales.size(2), "idx.size(2) (", idx.size(2), ") != scales.size(2) (", scales.size(2), ")");
+    } else {
+        TORCH_CHECK(idx.size(2) == n_kv_head, "idx.size(2) (", idx.size(2), ") != n_kv_head (", n_kv_head, ")");
+        TORCH_CHECK(scales.size(2) == n_kv_head, "scales.size(2) (", scales.size(2), ") != n_kv_head (", n_kv_head, ")");
+        TORCH_CHECK(idx.size(1) == scales.size(1), "idx.size(1) (", idx.size(1), ") != scales.size(1) (", scales.size(1), ")");
     }
     TORCH_CHECK(idx.size(3) == head_dim / d, "idx.size(3) (", idx.size(3), ") != head_dim / d (", head_dim / d, ")");
     TORCH_CHECK(idx.is_contiguous());
     TORCH_CHECK(scales.is_contiguous());
 
-    HeadsQuantize(x, cum_lengths, lattice, idx, scales, heads_first);
+    HeadsQuantize(x, cum_lengths, block_indices, lattice, idx, scales, heads_first);
 }
 
 void higgs_dequantize_heads(
-	at::Tensor &idx, // [batch, n_kv_heads, padded_T, head_dim // 2] codes
-	at::Tensor &scales, // [batch, n_kv_heads, padded_T] float norms
-	at::Tensor &cum_lengths, // [batch + 1] int32 prefix sums of the true lengths
+	at::Tensor &idx, // [max_batch, n_kv_heads, max_T, head_dim // 2] codes (the whole kv cache)
+	at::Tensor &scales, // [max_batch, n_kv_heads, max_T] float norms
+	at::Tensor &cum_lengths, // [batch + 1] int32 prefix sums of the active requests' lengths
+	at::Tensor &block_indices, // [batch]: kv-cache slots to dequantize (also the out slots, values distinct)
 	at::Tensor &lattice, // [256, 2] (4 bit)
-	at::Tensor &out, // [batch, n_kv_heads, padded_T, head_dim] dequantized keys (out)
+	at::Tensor &out, // [max_batch, n_kv_heads, max_T, head_dim], written at out[block_indices[b]]
 	float hadamard_scale
     ) {
     at::ScalarType idx_type = idx.scalar_type();
     at::ScalarType scales_type = scales.scalar_type();
+    at::ScalarType block_indices_type = block_indices.scalar_type();
     at::ScalarType cum_lengths_type = cum_lengths.scalar_type();
     at::ScalarType lattice_type = lattice.scalar_type();
     at::ScalarType out_type = out.scalar_type();
@@ -459,12 +482,14 @@ void higgs_dequantize_heads(
     TORCH_CHECK(idx_type == at::ScalarType::Byte);
     TORCH_CHECK(scales_type == at::ScalarType::Float);
     TORCH_CHECK(cum_lengths_type == at::ScalarType::Int);
+    TORCH_CHECK(block_indices_type == at::ScalarType::Int);
     TORCH_CHECK(lattice_type == at::ScalarType::BFloat16);
     TORCH_CHECK(out_type == at::ScalarType::BFloat16);
 
     TORCH_CHECK(idx.is_cuda());
     TORCH_CHECK(scales.is_cuda());
     TORCH_CHECK(cum_lengths.is_cuda());
+    TORCH_CHECK(block_indices.is_cuda());
     TORCH_CHECK(lattice.is_cuda());
     TORCH_CHECK(out.is_cuda());
 
@@ -472,26 +497,33 @@ void higgs_dequantize_heads(
     at::Device device = idx.device();
     TORCH_CHECK(device_index == scales.get_device());
     TORCH_CHECK(device_index == cum_lengths.get_device());
+    TORCH_CHECK(device_index == block_indices.get_device());
     TORCH_CHECK(device_index == lattice.get_device());
     TORCH_CHECK(device_index == out.get_device());
     TORCH_CHECK(device == scales.device());
     TORCH_CHECK(device == cum_lengths.device());
+    TORCH_CHECK(device == block_indices.device());
     TORCH_CHECK(device == lattice.device());
     TORCH_CHECK(device == out.device());
 
     TORCH_CHECK(idx.ndimension() == 4, "idx must be 4D, got ", idx.ndimension(), "D");
     TORCH_CHECK(scales.ndimension() == 3, "scales must be 3D, got ", scales.ndimension(), "D");
     TORCH_CHECK(cum_lengths.ndimension() == 1);
+    TORCH_CHECK(block_indices.ndimension() == 1);
     TORCH_CHECK(lattice.ndimension() == 2);
     TORCH_CHECK(out.ndimension() == 4, "out must be 4D, got ", out.ndimension(), "D");
 
     constexpr int kD = 2;
     constexpr int kHeadDim = 128;
 
-    int b = idx.size(0);
+    // idx/scales/out all span the whole kv cache; only b = block_indices.size(0) requests are
+    // active and only their slots are touched
+    int b = block_indices.size(0);
     TORCH_CHECK(idx.size(3) == kHeadDim / kD, "idx.size(3) (", idx.size(3), ") != head_dim / d (", kHeadDim / kD, ")");
     TORCH_CHECK(out.size(3) == kHeadDim, "out.size(3) (", out.size(3), ") != head_dim (", kHeadDim, ")");
-    for (int i = 0; i < 3; ++i) {
+    TORCH_CHECK(scales.size(0) == idx.size(0), "scales.size(0) (", scales.size(0), ") != idx.size(0) (", idx.size(0), ")");
+    TORCH_CHECK(out.size(0) == idx.size(0), "out.size(0) (", out.size(0), ") != idx.size(0) (", idx.size(0), ")");
+    for (int i = 1; i < 3; ++i) {
         TORCH_CHECK(scales.size(i) == idx.size(i), "scales.size(", i, ") (", scales.size(i), ") != idx.size(", i, ") (", idx.size(i), ")");
         TORCH_CHECK(out.size(i) == idx.size(i), "out.size(", i, ") (", out.size(i), ") != idx.size(", i, ") (", idx.size(i), ")");
     }
@@ -508,7 +540,7 @@ void higgs_dequantize_heads(
     TORCH_CHECK(lattice.size(1) == kD, "lattice.size(1) must be ", kD, ", got ", lattice.size(1));
     TORCH_CHECK(lattice.is_contiguous());
 
-    HeadsDequantize(idx, scales, cum_lengths, lattice, out, hadamard_scale);
+    HeadsDequantize(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
 }
 
 void init_higgs_lib(py::module &m) {

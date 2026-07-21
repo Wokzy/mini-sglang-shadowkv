@@ -83,14 +83,14 @@ __forceinline__ __device__ void hadamard_warp(float (&x)[kNElems]) {
 #endif
 
 template <int... Values>
-auto make_int_variant(int x) {
+auto make_int_variant(int x, const char* name = "value") {
     using Variant = std::variant<std::integral_constant<int, Values>...>;
 
     Variant v;
 
     bool matched = ((x == Values ? (v = std::integral_constant<int, Values>{}, true) : false) || ...);
 
-    TORCH_CHECK(matched, "unsupported value: ", x);
+    TORCH_CHECK(matched, "unsupported ", name, ": ", x, " (supported: ", c10::Join(", ", std::vector<int>{Values...}), ")");
     return v;
 }
 

@@ -7,10 +7,15 @@
 
 #include "higgs_quantizer.h"
 
-// Inverse of HeadsQuantizeKernel for the [2, 256] (4 bit) grid and the heads-major layout:
-//   out[b, h, t, :] = hadamard(lattice[codes[b, h, t, :]].flatten()) * scales[b, h, t] * hadamard_scale
-// codes are [B, n_kv_heads, T, head_dim / 2] uint8, scales [B, n_kv_heads, T] float,
-// out [B, n_kv_heads, T, head_dim] bf16. No predictor add, just plain dequantization.
+// Inverse of HeadsQuantizeKernel for the [2, 256] (4 bit) grid and the heads-major layout.
+// This is a decode kernel: codes/scales are the whole preallocated kv cache
+// ([max_batch_size, n_kv_heads, max_seq_len, ...]-shaped) while only batchSize <= max_batch_size
+// requests are active; the dequantized entry lands in the SAME slot of out:
+//   out[blockIndices[b], h, t, :] = hadamard(lattice[codes[blockIndices[b], h, t, :]].flatten())
+//                                   * scales[blockIndices[b], h, t] * hadamard_scale
+// so blockIndices values must be distinct. codes are [max_B, n_kv_heads, T, head_dim / 2] uint8,
+// scales [max_B, n_kv_heads, T] float, out [max_B, n_kv_heads, T, head_dim] bf16.
+// No predictor add, just plain dequantization.
 //
 // Same warp-per-token enumeration through cumulativeLengthes as the quantize kernel, but a warp
 // dequantizes two heads of its token at a time: each half-warp owns one head vector, lane l
@@ -24,8 +29,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) 
     const void *__restrict__ scalesPtr,
     void *__restrict__ outPtr,
     const int *__restrict__ cumulativeLengthes,
+    const int *__restrict__ blockIndices, // [batchSize]: kv-cache slots to dequantize (also the out slots)
     const void *__restrict__ latticePtr,
-    size_t batchSize,
+    size_t batchSize,                     // number of active requests; the cache can hold more entries
     size_t T,
     size_t nKvHeads,
     float hadamard_scale
@@ -80,17 +86,20 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) 
     for (int currentToken = globalWarpIdx; currentToken < totalTokens; currentToken += nWarps) {
         const int batchIdx = FindBatchIdxFromHint(cumulativeLengthes, batchSize, currentToken, batchHint);
         batchHint = batchIdx;
+        // batchIdx enumerates the active requests; both the cache reads and the out writes use
+        // slot blockIndices[batchIdx] (out has the same [max_batch, ...] shape as the cache)
+        const int kvCacheIdx = blockIndices[batchIdx];
         const int tokenWithinSample = currentToken - cumulativeLengthes[batchIdx];
         for (int headPair = 0; headPair < ceildiv(nKvHeads, kRowsPerWarp); ++headPair) {
             const int head = headPair * kRowsPerWarp + rowInWarp;
             const bool headValid = head < nKvHeads; // odd n_kv tail: the upper half-warp idles
-            const size_t row = (size_t(batchIdx) * nKvHeads + head) * T + tokenWithinSample;
+            const size_t cacheRow = (size_t(kvCacheIdx) * nKvHeads + head) * T + tokenWithinSample;
 
             CodeWord codes = 0;
             float mult = 0.0f;
             if (headValid) {
-                codes = idxLoad[row * (kNCodesPerHead / kCodesPerLane) + laneInRow];
-                mult = scalesLoad[row] * hadamard_scale;
+                codes = idxLoad[cacheRow * (kNCodesPerHead / kCodesPerLane) + laneInRow];
+                mult = scalesLoad[cacheRow] * hadamard_scale;
             }
 
             float x[kElemsPerLane];
@@ -112,7 +121,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) 
                 }
                 #pragma unroll
                 for (int c = 0; c < kInt4PerLane; ++c) {
-                    outStore[row * (kHeadDim * sizeof(nv_bfloat16) / sizeof(int4)) + laneInRow * kInt4PerLane + c] = reinterpret_cast<int4*>(result)[c];
+                    outStore[cacheRow * (kHeadDim * sizeof(nv_bfloat16) / sizeof(int4)) + laneInRow * kInt4PerLane + c] = reinterpret_cast<int4*>(result)[c];
                 }
             }
         }
@@ -124,6 +133,7 @@ void HeadsDequantizeImpl(
     at::Tensor &idx,
     at::Tensor &scales,
     at::Tensor &cum_lengths,
+    at::Tensor &block_indices,
     at::Tensor &lattice,
     at::Tensor &out,
     float hadamard_scale
@@ -147,9 +157,10 @@ void HeadsDequantizeImpl(
         scales.data_ptr(),
         out.data_ptr(),
         reinterpret_cast<int*>(cum_lengths.data_ptr()),
+        reinterpret_cast<const int*>(block_indices.data_ptr()),
         lattice.data_ptr(),
-        static_cast<size_t>(idx.size(0)),   // batchSize
-        static_cast<size_t>(idx.size(2)),   // T (padded seq len)
+        static_cast<size_t>(block_indices.size(0)),   // batchSize (active requests)
+        static_cast<size_t>(idx.size(2)),   // T (max_seq_len)
         static_cast<size_t>(idx.size(1)),   // nKvHeads
         hadamard_scale
     );
@@ -160,6 +171,7 @@ void HeadsDequantize(
     at::Tensor &idx,
     at::Tensor &scales,
     at::Tensor &cum_lengths,
+    at::Tensor &block_indices,
     at::Tensor &lattice,
     at::Tensor &out,
     float hadamard_scale
@@ -167,8 +179,8 @@ void HeadsDequantize(
     // 8 lanes per row (4 heads per warp iteration) amortizes shuffles/loop overhead best, but
     // would idle half the warp when the token has fewer than 4 heads to process
     if (idx.size(1) % 4 == 0) {
-        HeadsDequantizeImpl<512, 8>(idx, scales, cum_lengths, lattice, out, hadamard_scale);
+        HeadsDequantizeImpl<512, 8>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
     } else {
-        HeadsDequantizeImpl<512, 16>(idx, scales, cum_lengths, lattice, out, hadamard_scale);
+        HeadsDequantizeImpl<512, 16>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
     }
 }

@@ -325,10 +325,13 @@ class ShadowKVPool:
                 key_states_loc.view(
                     1, SL, self.local_kv_heads, self.model_config.head_dim
                 ).contiguous(),
-                lengths=torch.tensor([SL], dtype=torch.int64, device=self.device),
+                lengths=self.total_num_chunks,
                 grid=self.higgs_2bit_grid,
-                out_idx=self.landmarks_buffer.idx[layer_idx, [batch_index], :SL],
-                out_scales=self.landmarks_buffer.scales[layer_idx, [batch_index], :SL],
+                out=self.landmarks_buffer,
+                block_indices=torch.Tensor([batch_index]).to(
+                    device=self.device, dtype=torch.int32, non_blocking=True
+                ),
+                layer_idx=layer_idx,
                 heads_first=False,
             )
 
@@ -432,21 +435,17 @@ class ShadowKVPool:
                 self.max_num_landmarks,
                 self.batch_indices[:BS],
             )
-            scores = self.scores
         else:
-            scores = higgs_score(
-                QuantizedTensor(
-                    idx=self.landmarks_buffer.idx[layer_idx],
-                    scales=self.landmarks_buffer.scales[layer_idx],
-                ),
-                lengths=self.total_num_chunks[self.batch_indices[:BS]],
+            higgs_score(
+                self.landmarks_buffer,
+                lengths=self.total_num_chunks,
                 grid=self.higgs_2bit_grid,
                 query=query_states.view(BS, self.model_config.num_qo_heads, HD),
-                hadamard_scale=self.local_kv_heads * self.model_config.head_dim,
-                # out=self.scores[:BS],
+                hadamard_scale=(1 / self.model_config.head_dim),
+                block_indices=self.batch_indices[:BS],
+                out=self.scores,
+                layer_idx=layer_idx,
             )
-            scores = scores.transpose(1, 2)
-            assert scores.shape == (BS, self.local_kv_heads, self.max_num_landmarks)
 
         # TOPK
         for i in range(BS):
@@ -457,8 +456,7 @@ class ShadowKVPool:
                 continue
 
             torch.topk(
-                # self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
-                scores[i, :, : self.total_num_chunks[batch_idx]],
+                self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
                 k=num_selected_chunks,
                 sorted=False,
                 out=(

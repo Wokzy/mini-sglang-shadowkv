@@ -21,6 +21,11 @@
 // Tokens are enumerated through cumulativeLengthes exactly like in the score kernel, so padding
 // tokens (beyond each sample's true length) are never touched: idx/scales keep their old values
 // there. Since a warp owns a whole token, lengths need no rounding on the python side.
+//
+// This is the prefill kernel: x holds batchSize new requests, while idx/scales are the
+// preallocated kv cache ([max_batch_size, max_seq_len, ...]-shaped). Sample b is written into
+// cache slot blockIndices[b], so xT (padding of the input) and outT (max_seq_len of the cache)
+// can differ. blockIndices values must be distinct -- this is a scatter write.
 
 enum class HeadsLayout { kTokensMajor, kHeadsMajor };
 
@@ -30,9 +35,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock) HeadsQuantizeKernel(
     void *__restrict__ idxPtr,
     void *__restrict__ scalesPtr,
     const int *__restrict__ cumulativeLengthes,
+    const int *__restrict__ blockIndices, // [batchSize]: cache slot each input sample is written to
     const void *__restrict__ latticePtr,
     size_t batchSize,
-    size_t T,
+    size_t xT,
+    size_t outT,
     size_t nKvHeads
 ) {
     static_assert(kD == 2 || kD == 4, "only [2, 256] and [4, 256] grids are supported");
@@ -89,16 +96,21 @@ __global__ void __launch_bounds__(kThreadsPerBlock) HeadsQuantizeKernel(
     for (int currentToken = globalWarpIdx; currentToken < totalTokens; currentToken += nWarps) {
         const int batchIdx = FindBatchIdxFromHint(cumulativeLengthes, batchSize, currentToken, batchHint);
         batchHint = batchIdx;
+        // batchIdx indexes the input samples; the outputs are written into cache slot
+        // blockIndices[batchIdx] (with its own token stride outT)
+        const int kvCacheIdx = blockIndices[batchIdx];
         const int tokenWithinSample = currentToken - cumulativeLengthes[batchIdx];
         for (int head = 0; head < nKvHeads; ++head) {
-            size_t row; // flat index of the (batch, token, head) vector, head_dim is contiguous
+            size_t xRow, outRow; // flat indices of the (batch, token, head) vector, head_dim is contiguous
             if constexpr (kLayout == HeadsLayout::kTokensMajor) {
-                row = (size_t(batchIdx) * T + tokenWithinSample) * nKvHeads + head;
+                xRow = (size_t(batchIdx) * xT + tokenWithinSample) * nKvHeads + head;
+                outRow = (size_t(kvCacheIdx) * outT + tokenWithinSample) * nKvHeads + head;
             } else {
-                row = (size_t(batchIdx) * nKvHeads + head) * T + tokenWithinSample;
+                xRow = (size_t(batchIdx) * nKvHeads + head) * xT + tokenWithinSample;
+                outRow = (size_t(kvCacheIdx) * nKvHeads + head) * outT + tokenWithinSample;
             }
 
-            bfloat4 xValues = xLoad[row * (kHeadDim / kElemsPerLane) + laneId];
+            bfloat4 xValues = xLoad[xRow * (kHeadDim / kElemsPerLane) + laneId];
             float x[kElemsPerLane];
             float2 lo = __bfloat1622float2(xValues.lo);
             float2 hi = __bfloat1622float2(xValues.hi);
@@ -151,17 +163,17 @@ __global__ void __launch_bounds__(kThreadsPerBlock) HeadsQuantizeKernel(
             }
 
             if constexpr (kGroupsPerLane == 1) {
-                idxStore[row * kNCodesPerHead + laneId] = uint8_t(__float_as_uint(best[0]) & 0xFFu);
+                idxStore[outRow * kNCodesPerHead + laneId] = uint8_t(__float_as_uint(best[0]) & 0xFFu);
             } else {
                 uint8_t codes[kGroupsPerLane];
                 #pragma unroll
                 for (int g = 0; g < kGroupsPerLane; ++g) {
                     codes[g] = uint8_t(__float_as_uint(best[g]) & 0xFFu);
                 }
-                reinterpret_cast<uint16_t*>(idxStore + row * kNCodesPerHead)[laneId] = *reinterpret_cast<uint16_t*>(codes);
+                reinterpret_cast<uint16_t*>(idxStore + outRow * kNCodesPerHead)[laneId] = *reinterpret_cast<uint16_t*>(codes);
             }
             if (laneId == 0) {
-                scalesStore[row] = scale;
+                scalesStore[outRow] = scale;
             }
         }
     }
@@ -171,6 +183,7 @@ template <int kD, HeadsLayout kLayout, size_t kThreadsPerBlock>
 void HeadsQuantizeImpl(
     at::Tensor &x,
     at::Tensor &cum_lengths,
+    at::Tensor &block_indices,
     at::Tensor &lattice,
     at::Tensor &idx,
     at::Tensor &scales
@@ -189,7 +202,8 @@ void HeadsQuantizeImpl(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    size_t T = kLayout == HeadsLayout::kTokensMajor ? x.size(1) : x.size(2);
+    size_t xT = kLayout == HeadsLayout::kTokensMajor ? x.size(1) : x.size(2);
+    size_t outT = kLayout == HeadsLayout::kTokensMajor ? idx.size(1) : idx.size(2);
     size_t nKvHeads = kLayout == HeadsLayout::kTokensMajor ? x.size(2) : x.size(1);
 
     kernelInstance<<<gridDim, blockDim, 0, stream>>>(
@@ -197,9 +211,11 @@ void HeadsQuantizeImpl(
         idx.data_ptr(),
         scales.data_ptr(),
         reinterpret_cast<int*>(cum_lengths.data_ptr()),
+        reinterpret_cast<const int*>(block_indices.data_ptr()),
         lattice.data_ptr(),
-        static_cast<size_t>(x.size(0)),   // batchSize
-        T,                                // padded seq len
+        static_cast<size_t>(x.size(0)),   // batchSize (input samples)
+        xT,                               // padded seq len of the input
+        outT,                             // max_seq_len of the kv cache
         nKvHeads
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -208,6 +224,7 @@ void HeadsQuantizeImpl(
 void HeadsQuantize(
     at::Tensor &x,
     at::Tensor &cum_lengths,
+    at::Tensor &block_indices,
     at::Tensor &lattice,
     at::Tensor &idx,
     at::Tensor &scales,
@@ -215,10 +232,10 @@ void HeadsQuantize(
 ) {
     int d = lattice.size(1); // validated in higgs_quantize_heads
     if (d == 4) {
-        if (heads_first) HeadsQuantizeImpl<4, HeadsLayout::kHeadsMajor, 512>(x, cum_lengths, lattice, idx, scales);
-        else HeadsQuantizeImpl<4, HeadsLayout::kTokensMajor, 512>(x, cum_lengths, lattice, idx, scales);
+        if (heads_first) HeadsQuantizeImpl<4, HeadsLayout::kHeadsMajor, 512>(x, cum_lengths, block_indices, lattice, idx, scales);
+        else HeadsQuantizeImpl<4, HeadsLayout::kTokensMajor, 512>(x, cum_lengths, block_indices, lattice, idx, scales);
     } else {
-        if (heads_first) HeadsQuantizeImpl<2, HeadsLayout::kHeadsMajor, 512>(x, cum_lengths, lattice, idx, scales);
-        else HeadsQuantizeImpl<2, HeadsLayout::kTokensMajor, 512>(x, cum_lengths, lattice, idx, scales);
+        if (heads_first) HeadsQuantizeImpl<2, HeadsLayout::kHeadsMajor, 512>(x, cum_lengths, block_indices, lattice, idx, scales);
+        else HeadsQuantizeImpl<2, HeadsLayout::kTokensMajor, 512>(x, cum_lengths, block_indices, lattice, idx, scales);
     }
 }
