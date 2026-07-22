@@ -8,6 +8,7 @@ from minisgl.utils import div_even, init_logger
 
 from minisgl.kernel.shadowkv import (
     shadowkv_score_landmarks_kernel_hd128,
+    shadowkv_topk_kernel,
 )
 
 from minisgl.kernel import store_cache
@@ -47,6 +48,7 @@ class ShadowKVConfig:
     enable_offloading: bool = False
     kv_cache_dtype: str | torch.dtype = "bf16"
     landmarks_dtype: str | torch.dtype = "bf16"
+    # use_naive_topk: bool = False
 
     def __post_init__(self):
         self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
@@ -164,7 +166,7 @@ class ShadowKVPool:
         )
         self.prefix_end_indices = [0] * max_batch_size
         self.suffix_start_indices = [0] * max_batch_size
-        self.num_chunks_to_select = [0] * max_batch_size
+        self.num_chunks_to_select: torch.Tensor = None
         self.max_num_chunks_to_select = 0
 
         self.total_num_chunks = torch.empty(
@@ -361,11 +363,12 @@ class ShadowKVPool:
             rounding_mode="floor",
             out=self.total_num_chunks,
         )
-        self.num_chunks_to_select = (
-            self.pruned_infix_lens.cpu() // self.config.chunk_size
-        ).tolist()
 
-        self.max_num_chunks_to_select = max(self.num_chunks_to_select)
+        self.num_chunks_to_select = self.pruned_infix_lens // self.config.chunk_size
+
+        # self.num_chunks_to_select = (
+        #     self.pruned_infix_lens.cpu() // self.config.chunk_size
+        # ).tolist()
 
         self.store_cache_indices = (
             torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)
@@ -448,22 +451,29 @@ class ShadowKVPool:
             )
 
         # TOPK
-        for i in range(BS):
-            batch_idx = self._cpu_batch_indices[i]
-            num_selected_chunks = self.num_chunks_to_select[batch_idx]
-            # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
-            if num_selected_chunks == 0:
-                continue
+        shadowkv_topk_kernel(
+            scores=self.scores,
+            total_num_chunks=self.total_num_chunks,
+            num_chunks_to_select=self.num_chunks_to_select,
+            batch_indices=self.batch_indices[:BS],
+            out=self.selected_chunks,
+        )
+        # for i in range(BS):
+        #     batch_idx = self._cpu_batch_indices[i]
+        #     num_selected_chunks = self.num_chunks_to_select[batch_idx]
+        #     # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
+        #     if num_selected_chunks == 0:
+        #         continue
 
-            torch.topk(
-                self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
-                k=num_selected_chunks,
-                sorted=False,
-                out=(
-                    self._topk_values_buffer[:, :num_selected_chunks],
-                    self.selected_chunks[batch_idx, :, :num_selected_chunks],
-                ),
-            )
+        #     torch.topk(
+        #         self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
+        #         k=num_selected_chunks,
+        #         sorted=False,
+        #         out=(
+        #             self._topk_values_buffer[:, :num_selected_chunks],
+        #             self.selected_chunks[batch_idx, :, :num_selected_chunks],
+        #         ),
+        #     )
 
         gather_kv_cache(
             self.prefix_lens,
