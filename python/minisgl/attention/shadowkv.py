@@ -119,6 +119,7 @@ class ShadowKVPool:
             )
         else:
             self.edenn_d = 4
+            self.higgs_hadamard_scale = 1 / self.model_config.head_dim
             assert (self.local_kv_heads * self.model_config.head_dim % self.edenn_d) == 0
 
             self.higgs_2bit_grid = get_2bit_grid(device=self.device, dtype=self.dtype)
@@ -166,7 +167,9 @@ class ShadowKVPool:
         )
         self.prefix_end_indices = [0] * max_batch_size
         self.suffix_start_indices = [0] * max_batch_size
-        self.num_chunks_to_select: torch.Tensor = None
+        self.num_chunks_to_select = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=self.device
+        )
         self.max_num_chunks_to_select = 0
 
         self.total_num_chunks = torch.empty(
@@ -289,29 +292,24 @@ class ShadowKVPool:
 
         # self.scores[batch_index].fill_(float("-inf"))
 
-        key_states_loc = key_states[
+        new_landmarks = key_states[
             self.prefix_end_indices[batch_index] : self.suffix_start_indices[batch_index]
         ]
-        SL = key_states_loc.shape[0]
-        # assert SL > 0, f"{key_states.shape} {batch_indices=} {self.prefix_end_indices[batch_index]} {self.suffix_start_indices[batch_index]}"
-        # print(layer_idx, SL, SL % self.config.chunk_size)
+
+        if self.config.chunk_size > 1:
+            new_landmarks = new_landmarks.view(
+                num_chunks,
+                self.config.chunk_size,
+                self.local_kv_heads,
+                self.model_config.head_dim,
+            )
+
+            new_landmarks = torch.mean(new_landmarks, dim=1)
+
+        new_landmarks = new_landmarks.contiguous()
 
         if not self.config.quantize_landmarks:
-            key_states_loc = key_states_loc.view(
-                SL, self.local_kv_heads, self.model_config.head_dim
-            )
-            key_states_loc = key_states_loc.transpose(0, 1)
-            if self.config.chunk_size > 1:
-                key_states_loc = key_states_loc.view(
-                    self.local_kv_heads,
-                    num_chunks,
-                    self.config.chunk_size,
-                    self.model_config.head_dim,
-                )
-
-                new_landmarks = torch.mean(key_states_loc, dim=2)
-            else:
-                new_landmarks = key_states_loc
+            new_landmarks = new_landmarks.transpose(0, 1)
 
             self.landmarks_buffer[layer_idx, batch_index, :, :num_chunks].copy_(
                 new_landmarks.to(dtype=self.config.landmarks_dtype)
@@ -320,12 +318,9 @@ class ShadowKVPool:
             #     dim=1, index=torch.arange(num_chunks, device=self.device), source=new_landmarks
             # )
         else:
-            assert (
-                self.config.chunk_size == 1
-            ), "Quantized landmarks only supported for chunk size 1"
             higgs_quantize_heads(
-                key_states_loc.view(
-                    1, SL, self.local_kv_heads, self.model_config.head_dim
+                new_landmarks.view(
+                    1, num_chunks, self.local_kv_heads, self.model_config.head_dim
                 ).contiguous(),
                 lengths=self.total_num_chunks,
                 grid=self.higgs_2bit_grid,
@@ -336,9 +331,6 @@ class ShadowKVPool:
                 layer_idx=layer_idx,
                 heads_first=False,
             )
-
-        # if layer_idx == 3:
-        #     print(self.landmarks_buffer[layer_idx, batch_index])
 
     def prepare_shadowkv_metadata(self, seqlens: list[int], batch_indices: list[int]):
         fill_prefill_metadata(
@@ -364,7 +356,14 @@ class ShadowKVPool:
             out=self.total_num_chunks,
         )
 
-        self.num_chunks_to_select = self.pruned_infix_lens // self.config.chunk_size
+        torch.div(
+            self.pruned_infix_lens,
+            self.config.chunk_size,
+            rounding_mode="floor",
+            out=self.num_chunks_to_select,
+        )
+
+        # self.num_chunks_to_select = self.pruned_infix_lens // self.config.chunk_size
 
         # self.num_chunks_to_select = (
         #     self.pruned_infix_lens.cpu() // self.config.chunk_size
@@ -419,14 +418,14 @@ class ShadowKVPool:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
 
-        torch.mean(
-            query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD),
-            dim=2,
-            out=self._mean_query_states[:BS],
-        )
-
         # SCORING
         if not self.config.quantize_landmarks:
+            torch.mean(
+                query_states.view(BS, self.local_kv_heads, self.gqa_factor, 1, HD),
+                dim=2,
+                out=self._mean_query_states[:BS],
+            )
+
             landmarks = self.landmarks_buffer[layer_idx]
 
             shadowkv_score_landmarks_kernel_hd128(
@@ -443,8 +442,8 @@ class ShadowKVPool:
                 self.landmarks_buffer,
                 lengths=self.total_num_chunks,
                 grid=self.higgs_2bit_grid,
-                query=query_states.view(BS, self.model_config.num_qo_heads, HD),
-                hadamard_scale=(1 / self.model_config.head_dim),
+                query=query_states,
+                hadamard_scale=self.higgs_hadamard_scale,
                 block_indices=self.batch_indices[:BS],
                 out=self.scores,
                 layer_idx=layer_idx,
