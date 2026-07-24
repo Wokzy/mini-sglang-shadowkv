@@ -4,6 +4,8 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 COMPUTE_CAP = os.environ.get('COMPUTE_CAP', '90')
+if int(COMPUTE_CAP) >= 90:
+    COMPUTE_CAP += 'a'
 
 setup(
     ext_modules=[
