@@ -7,15 +7,18 @@
 
 #include "higgs_quantizer.h"
 
-// Inverse of HeadsQuantizeKernel for the [2, 256] (4 bit) grid and the heads-major layout.
+// Inverse of HeadsQuantizeKernel for the [2, 256] (4 bit) grid.
 // This is a decode kernel: codes/scales are the whole preallocated kv cache
-// ([max_batch_size, n_kv_heads, max_seq_len, ...]-shaped) while only batchSize <= max_batch_size
-// requests are active; the dequantized entry lands in the SAME slot of out:
+// ([max_batch_size, n_kv_heads, max_seq_len, ...]-shaped for the heads-major layout,
+// [max_batch_size, max_seq_len, n_kv_heads, ...]-shaped for the tokens-major one) while only
+// batchSize <= max_batch_size requests are active; the dequantized entry lands in the SAME
+// slot of out:
 //   out[blockIndices[b], h, t, :] = hadamard(lattice[codes[blockIndices[b], h, t, :]].flatten())
 //                                   * scales[blockIndices[b], h, t] * hadamard_scale
 // so blockIndices values must be distinct. codes are [max_B, n_kv_heads, T, head_dim / 2] uint8,
-// scales [max_B, n_kv_heads, T] float, out [max_B, n_kv_heads, T, head_dim] bf16.
-// No predictor add, just plain dequantization.
+// scales [max_B, n_kv_heads, T] float, out [max_B, n_kv_heads, T, head_dim] bf16 (t/h dims
+// swapped for tokens-major). The layout only changes the flat row index of a head vector --
+// head_dim stays contiguous. No predictor add, just plain dequantization.
 //
 // Same warp-per-token enumeration through cumulativeLengthes as the quantize kernel, but a warp
 // dequantizes two heads of its token at a time: each half-warp owns one head vector, lane l
@@ -23,7 +26,9 @@
 // whole warp per head this halves the shuffle count per row, doubles the load/store widths and
 // amortizes the address math -- the kernel is instruction- rather than DRAM-bound. Padding
 // tokens are never touched, lengths need no rounding on the python side.
-template <size_t kThreadsPerBlock, int kLanesPerRow>
+enum class DequantHeadsLayout { kTokensMajor, kHeadsMajor };
+
+template <size_t kThreadsPerBlock, int kLanesPerRow, DequantHeadsLayout kLayout>
 __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) HeadsDequantizeKernel(
     const void *__restrict__ idxPtr,
     const void *__restrict__ scalesPtr,
@@ -93,7 +98,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) 
         for (int headPair = 0; headPair < ceildiv(nKvHeads, kRowsPerWarp); ++headPair) {
             const int head = headPair * kRowsPerWarp + rowInWarp;
             const bool headValid = head < nKvHeads; // odd n_kv tail: the upper half-warp idles
-            const size_t cacheRow = (size_t(kvCacheIdx) * nKvHeads + head) * T + tokenWithinSample;
+            size_t cacheRow;
+            if constexpr (kLayout == DequantHeadsLayout::kHeadsMajor) {
+                cacheRow = (size_t(kvCacheIdx) * nKvHeads + head) * T + tokenWithinSample;
+            } else {
+                cacheRow = (size_t(kvCacheIdx) * T + tokenWithinSample) * nKvHeads + head;
+            }
 
             CodeWord codes = 0;
             float mult = 0.0f;
@@ -128,7 +138,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kLanesPerRow == 16 ? 4 : 2) 
     }
 }
 
-template <size_t kThreadsPerBlock, int kLanesPerRow>
+template <size_t kThreadsPerBlock, int kLanesPerRow, DequantHeadsLayout kLayout>
 void HeadsDequantizeImpl(
     at::Tensor &idx,
     at::Tensor &scales,
@@ -140,7 +150,7 @@ void HeadsDequantizeImpl(
 ) {
     at::cuda::CUDAGuard device_guard{(char)idx.get_device()};
 
-    auto* kernelInstance = HeadsDequantizeKernel<kThreadsPerBlock, kLanesPerRow>;
+    auto* kernelInstance = HeadsDequantizeKernel<kThreadsPerBlock, kLanesPerRow, kLayout>;
     int numBlocks = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernelInstance, kThreadsPerBlock, 0);
 
@@ -152,6 +162,11 @@ void HeadsDequantizeImpl(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    const size_t T = kLayout == DequantHeadsLayout::kHeadsMajor
+        ? static_cast<size_t>(idx.size(2)) : static_cast<size_t>(idx.size(1));
+    const size_t nKvHeads = kLayout == DequantHeadsLayout::kHeadsMajor
+        ? static_cast<size_t>(idx.size(1)) : static_cast<size_t>(idx.size(2));
+
     kernelInstance<<<gridDim, blockDim, 0, stream>>>(
         idx.data_ptr(),
         scales.data_ptr(),
@@ -160,8 +175,8 @@ void HeadsDequantizeImpl(
         reinterpret_cast<const int*>(block_indices.data_ptr()),
         lattice.data_ptr(),
         static_cast<size_t>(block_indices.size(0)),   // batchSize (active requests)
-        static_cast<size_t>(idx.size(2)),   // T (max_seq_len)
-        static_cast<size_t>(idx.size(1)),   // nKvHeads
+        T,                                  // T (max_seq_len)
+        nKvHeads,                           // nKvHeads
         hadamard_scale
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -174,13 +189,23 @@ void HeadsDequantize(
     at::Tensor &block_indices,
     at::Tensor &lattice,
     at::Tensor &out,
-    float hadamard_scale
+    float hadamard_scale,
+    bool heads_first
 ) {
+    const int nKvHeads = heads_first ? idx.size(1) : idx.size(2);
     // 8 lanes per row (4 heads per warp iteration) amortizes shuffles/loop overhead best, but
     // would idle half the warp when the token has fewer than 4 heads to process
-    if (idx.size(1) % 4 == 0) {
-        HeadsDequantizeImpl<512, 8>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+    if (heads_first) {
+        if (nKvHeads % 4 == 0) {
+            HeadsDequantizeImpl<512, 8, DequantHeadsLayout::kHeadsMajor>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+        } else {
+            HeadsDequantizeImpl<512, 16, DequantHeadsLayout::kHeadsMajor>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+        }
     } else {
-        HeadsDequantizeImpl<512, 16>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+        if (nKvHeads % 4 == 0) {
+            HeadsDequantizeImpl<512, 8, DequantHeadsLayout::kTokensMajor>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+        } else {
+            HeadsDequantizeImpl<512, 16, DequantHeadsLayout::kTokensMajor>(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+        }
     }
 }

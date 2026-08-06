@@ -2,6 +2,8 @@ import os
 import torch
 import typing as tp
 
+from dataclasses import dataclass
+
 from collections import namedtuple
 
 # from minisgl.shadowkv_kernels import higgs_quantize, higgs_dequantize, higgs_dequantize_full
@@ -21,6 +23,43 @@ def get_2bit_grid(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     grid = torch.load(file, map_location="cpu").to(device=device, dtype=dtype)
 
     return grid
+
+def get_4bit_grid(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    file = f"{os.path.dirname(os.path.abspath(__file__))}/grids/EDEN2-256.pt"
+    grid = torch.load(file, map_location="cpu").to(device=device, dtype=dtype)
+
+    return grid
+
+@dataclass(frozen=False)
+class HiggsQuantizationMeta:
+    cfg: str = None
+    edenn_d: int = None
+    grid: torch.Tensor = None
+    hadamard_scale: torch.Tensor = None
+    idx_dtype: torch.dtype = None
+    scales_dtype: torch.dtype = torch.float32
+    quantized_head_dim: int = None
+
+    @classmethod
+    def from_config(cls, cfg: str, head_dim, device, dtype):
+        if cfg == '2bit':
+            return cls(
+                cfg=cfg,
+                edenn_d=4,
+                grid=get_2bit_grid(device, dtype),
+                hadamard_scale=(1 / head_dim),
+                idx_dtype=torch.uint8,
+                quantized_head_dim=(head_dim // 4),
+            )
+        elif cfg == '4bit':
+            return cls(
+                cfg=cfg,
+                edenn_d=2,
+                grid=get_4bit_grid(device, dtype),
+                hadamard_scale=(1 / head_dim),
+                idx_dtype=torch.uint8,
+                quantized_head_dim=(head_dim // 2),
+            )
 
 
 QuantizedTensor = namedtuple("QuantizedTensor", ["idx", "scales"])
@@ -77,13 +116,6 @@ def higgs_quantize_heads(
     d = grid.shape[1]
     batch_size = x.shape[0]
 
-    out_idx = out.idx
-    out_scales = out.scales
-
-    if layer_idx is not None:
-        out_idx = out_idx[layer_idx]
-        out_scales = out_scales[layer_idx]
-
     if out is None:
         assert (
             block_indices is None
@@ -127,13 +159,16 @@ def higgs_dequantize_heads(
     hadamard_scale: float,
     block_indices: tp.Optional[torch.Tensor] = None,
     out: tp.Optional[torch.Tensor] = None,
+    heads_first: bool = True,
 ) -> torch.Tensor:
-    # Decode kernel, inverse of higgs_quantize_heads(..., heads_first=True) with a [256, 2]
-    # (4-bit) grid. `quantized` is the whole preallocated kv cache:
+    # Decode kernel, inverse of higgs_quantize_heads(..., heads_first=heads_first) with a
+    # [256, 2] (4-bit) grid. `quantized` is the whole preallocated kv cache:
     # codes [max_batch_size, n_kv_heads, max_T, head_dim // 2] + scales
-    # [max_batch_size, n_kv_heads, max_T]. Only batch_size <= max_batch_size requests are
-    # active; out spans the whole cache too ([max_batch_size, n_kv_heads, max_T, head_dim]
-    # bf16) and the dequantized entries land in the same slots:
+    # [max_batch_size, n_kv_heads, max_T] (with heads_first=False the t/h dims are swapped:
+    # codes [max_batch_size, max_T, n_kv_heads, head_dim // 2] + scales
+    # [max_batch_size, max_T, n_kv_heads]). Only batch_size <= max_batch_size requests are
+    # active; out spans the whole cache too (same layout as codes, head_dim last, bf16) and
+    # the dequantized entries land in the same slots:
     # out[block_indices[b]] = dequant(cache[block_indices[b]]) (identity mapping over all
     # slots by default; block_indices values must be distinct). Untouched slots keep their
     # old values. `lengths`: [max_batch_size] int, tokens per cache slot, indexed through
@@ -164,7 +199,14 @@ def higgs_dequantize_heads(
         )
 
     higgs_quantization_cuda.higgs_dequantize_heads(
-        quantized.idx, quantized.scales, cum_lengths, block_indices, grid, out, hadamard_scale
+        quantized.idx,
+        quantized.scales,
+        cum_lengths,
+        block_indices,
+        grid,
+        out,
+        hadamard_scale,
+        heads_first,
     )
 
     return out

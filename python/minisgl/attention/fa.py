@@ -56,18 +56,12 @@ class FlashAttentionBackend(BaseAttnBackend):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ):
         metadata: FAMetadata = batch.attn_metadata
-        batch_indices = [req.table_idx for req in batch.padded_reqs]
-        self.kvcache.store_kv(k, v, layer_id)
+        cache_batch_idx = metadata.cache_batch_idx
+        self.kvcache.store_kv(k, v, layer_id, is_prefill=batch.is_prefill, batch_indices=cache_batch_idx)
 
         if batch.is_prefill:
             q_flash = q.view(1, q.shape[0], self.kvcache.local_qo_heads, self.config.head_dim)
-        else:
-            q_flash = q.view(
-                len(batch_indices), 1, self.kvcache.local_qo_heads, self.config.head_dim
-            )
-
-        cache_batch_idx = metadata.cache_batch_idx
-        if batch.is_prefill:
+            batch_indices = [req.table_idx for req in batch.padded_reqs]
             cache_batch_idx = torch.Tensor([0]).to(
                 device=self.kvcache.device, dtype=torch.int32, non_blocking=True
             )
@@ -75,6 +69,9 @@ class FlashAttentionBackend(BaseAttnBackend):
             k_cache = k.view(1, k.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
             v_cache = v.view(1, v.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
         else:
+            q_flash = q.view(
+                metadata.cache_batch_idx.shape[0], 1, self.kvcache.local_qo_heads, self.config.head_dim
+            )
             k_cache, v_cache = self.kvcache.select_kv(
                 q,
                 layer_id,

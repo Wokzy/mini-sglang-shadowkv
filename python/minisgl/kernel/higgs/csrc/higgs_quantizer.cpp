@@ -10,7 +10,7 @@ void higgs_dequantize_d4_n256_cuda(DequantizeParams &params, cudaStream_t stream
 void higgs_dequantize_d4_n256_full_cuda(DequantizeFullParams &params, cudaStream_t stream);
 void LandmarksScore(at::Tensor &landmarks, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &query, at::Tensor &out, float hadamard_scale);
 void HeadsQuantize(at::Tensor &x, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &idx, at::Tensor &scales, bool heads_first);
-void HeadsDequantize(at::Tensor &idx, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &out, float hadamard_scale);
+void HeadsDequantize(at::Tensor &idx, at::Tensor &scales, at::Tensor &cum_lengths, at::Tensor &block_indices, at::Tensor &lattice, at::Tensor &out, float hadamard_scale, bool heads_first);
 
 void set_quantize_params(
     QuantizeParams &params,
@@ -464,13 +464,14 @@ void higgs_quantize_heads(
 }
 
 void higgs_dequantize_heads(
-	at::Tensor &idx, // [max_batch, n_kv_heads, max_T, head_dim // 2] codes (the whole kv cache)
-	at::Tensor &scales, // [max_batch, n_kv_heads, max_T] float norms
+	at::Tensor &idx, // [max_batch, n_kv_heads, max_T, head_dim // 2] codes (the whole kv cache), [max_batch, max_T, n_kv_heads, head_dim // 2] if not heads_first
+	at::Tensor &scales, // [max_batch, n_kv_heads, max_T] float norms (t/h swapped if not heads_first)
 	at::Tensor &cum_lengths, // [batch + 1] int32 prefix sums of the active requests' lengths
 	at::Tensor &block_indices, // [batch]: kv-cache slots to dequantize (also the out slots, values distinct)
 	at::Tensor &lattice, // [256, 2] (4 bit)
-	at::Tensor &out, // [max_batch, n_kv_heads, max_T, head_dim], written at out[block_indices[b]]
-	float hadamard_scale
+	at::Tensor &out, // [max_batch, n_kv_heads, max_T, head_dim], written at out[block_indices[b]] (t/h swapped if not heads_first)
+	float hadamard_scale,
+	bool heads_first
     ) {
     at::ScalarType idx_type = idx.scalar_type();
     at::ScalarType scales_type = scales.scalar_type();
@@ -540,7 +541,7 @@ void higgs_dequantize_heads(
     TORCH_CHECK(lattice.size(1) == kD, "lattice.size(1) must be ", kD, ", got ", lattice.size(1));
     TORCH_CHECK(lattice.is_contiguous());
 
-    HeadsDequantize(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale);
+    HeadsDequantize(idx, scales, cum_lengths, block_indices, lattice, out, hadamard_scale, heads_first);
 }
 
 void init_higgs_lib(py::module &m) {
