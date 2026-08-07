@@ -208,6 +208,15 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
+
+        # Unlike the regular attention backends, ShadowKV keeps the active batch
+        # metadata in pool-owned tensors and reuses them for every batch.  With
+        # overlap scheduling, this method runs on the scheduler stream while the
+        # preceding forward is still consuming those tensors on the engine stream.
+        # Order the metadata rewrite after that forward without blocking the CPU.
+        if self.engine.ctx.shadowkv_enabled:
+            self.stream.wait_stream(self.engine.stream)
+
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
