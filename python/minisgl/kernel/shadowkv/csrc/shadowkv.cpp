@@ -18,7 +18,9 @@ void fill_prefill_metadata(torch::Tensor prefix_lens, torch::Tensor infix_lens,
                            torch::Tensor seq_lens, torch::Tensor batch_indices,
                            float sink_chunks_ratio, float sparse_chunks_ratio,
                            float local_chunks_ratio,
-                           size_t min_seq_len_to_prune, size_t chunk_len) {
+                           size_t min_seq_len_to_prune, size_t chunk_len,
+                           size_t sparse_chunks_budget,
+                           bool sparse_budget_is_absolute) {
   fill_prefill_metadata_launcher(
       FillPrefillMetadataParams{
           .prefix_lens = prefix_lens.data_ptr<int>(),
@@ -26,6 +28,8 @@ void fill_prefill_metadata(torch::Tensor prefix_lens, torch::Tensor infix_lens,
           .pruned_infix_lens = pruned_infix_lens.data_ptr<int>(),
           .sink_chunks_ratio = sink_chunks_ratio,
           .sparse_chunks_ratio = sparse_chunks_ratio,
+          .sparse_chunks_budget = sparse_chunks_budget,
+          .sparse_budget_is_absolute = sparse_budget_is_absolute,
           .local_chunks_ratio = local_chunks_ratio,
           .min_seq_len_to_prune = min_seq_len_to_prune,
           .chunk_len = chunk_len,

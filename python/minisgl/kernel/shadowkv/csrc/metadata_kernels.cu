@@ -16,9 +16,11 @@ find_prefix_infix_and_pruned_infix_lengths(size_t full_seq_len,
                                            size_t chunk_len,
                                            float sink_chunks_ratio,
                                            float sparse_chunks_ratio,
+                                           size_t sparse_chunks_budget,
+                                           bool sparse_budget_is_absolute,
                                            float local_chunks_ratio,
                                            size_t min_seq_len_to_prune) {
-  if (full_seq_len <= min_seq_len_to_prune) {
+  if (!sparse_budget_is_absolute && full_seq_len <= min_seq_len_to_prune) {
     return {full_seq_len, 0, 0};
   }
 
@@ -40,11 +42,20 @@ find_prefix_infix_and_pruned_infix_lengths(size_t full_seq_len,
     infix_len -= infix_extra;
   }
 
-  size_t pruned_infix_len = std::min(
-      (static_cast<size_t>(sparse_chunks_ratio * full_seq_len) / chunk_len) *
-          chunk_len, infix_len);
+  size_t pruned_infix_len;
+  if (sparse_budget_is_absolute) {
+    const size_t available_infix_chunks = infix_len / chunk_len;
+    pruned_infix_len =
+        std::min(sparse_chunks_budget, available_infix_chunks) * chunk_len;
+  } else {
+    pruned_infix_len = std::min(
+        (static_cast<size_t>(sparse_chunks_ratio * full_seq_len) / chunk_len) *
+            chunk_len,
+        infix_len);
+  }
   const size_t pruned_seq_len = prefix_len + pruned_infix_len + suffix_len;
-  if (pruned_seq_len < full_seq_len && pruned_seq_len < min_seq_len_to_prune) {
+  if (!sparse_budget_is_absolute && pruned_seq_len < full_seq_len &&
+      pruned_seq_len < min_seq_len_to_prune) {
     const size_t min_pruned_infix_len =
         min_seq_len_to_prune - prefix_len - suffix_len;
     const size_t extra = min_pruned_infix_len % chunk_len;
@@ -67,6 +78,7 @@ __global__ void shadowkv_fill_prefill_state_kernel(
         find_prefix_infix_and_pruned_infix_lengths(
             params.full_seq_lens[batch_idx], params.chunk_len,
             params.sink_chunks_ratio, params.sparse_chunks_ratio,
+            params.sparse_chunks_budget, params.sparse_budget_is_absolute,
             params.local_chunks_ratio, params.min_seq_len_to_prune);
     params.prefix_lens[kv_cache_idx] = prefix_len;
     params.infix_lens[kv_cache_idx] = infix_len;

@@ -78,7 +78,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             )
 
         return flash3_kvcache_impl(
-            q_flash.to(k_cache.dtype),
+            q_flash,
             k_cache,
             v_cache,
             cache_seqlens=metadata.cache_seqlens,

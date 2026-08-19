@@ -12,6 +12,8 @@ struct FillPrefillMetadataParams {
   int* pruned_infix_lens = nullptr;
   float sink_chunks_ratio = 0.0f;
   float sparse_chunks_ratio = 0.0f;
+  size_t sparse_chunks_budget = 0;
+  bool sparse_budget_is_absolute = false;
   float local_chunks_ratio = 0.0f;
   size_t min_seq_len_to_prune = 0;
   size_t chunk_len = 0;

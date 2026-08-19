@@ -42,7 +42,7 @@ class ShadowKVConfig:
     enabled: bool = False
     chunk_size: int = 8
     prefix_budget: float = 0.006125
-    sparse_budget: float = 0.125
+    sparse_budget: float | int = 0.125
     suffix_budget: float = 0.06125
     total_budget: float = 0.0
     min_seqlen_to_prune: int = 512
@@ -54,7 +54,12 @@ class ShadowKVConfig:
     # use_naive_topk: bool = False
 
     def __post_init__(self):
-        self.total_budget = self.prefix_budget + self.sparse_budget + self.suffix_budget
+        if isinstance(self.sparse_budget, bool) or not isinstance(self.sparse_budget, (float, int)):
+            raise TypeError("Sparse budget must be a float ratio or an integer chunk count")
+        assert self.sparse_budget >= 0, "Sparse budget cannot be negative"
+
+        sparse_budget_ratio = 0.0 if self.sparse_budget_is_absolute else self.sparse_budget
+        self.total_budget = self.prefix_budget + sparse_budget_ratio + self.suffix_budget
         assert self.total_budget <= 1.0, "Total Budget cannot be greater than 100%"
 
         if self.enabled:
@@ -63,6 +68,10 @@ class ShadowKVConfig:
     @classmethod
     def from_dict(cls, config: dict):
         return cls(**config)
+
+    @property
+    def sparse_budget_is_absolute(self) -> bool:
+        return isinstance(self.sparse_budget, int) and not isinstance(self.sparse_budget, bool)
 
 
 class ShadowKVPool:
@@ -115,7 +124,9 @@ class ShadowKVPool:
                 f"ShadowkvPool: Allocated {(self.landmarks_buffer.numel() * self.landmarks_buffer.element_size()) / 2**30:.2f} GiB for Landmarks ({self.dtype})"
             )
         else:
-            self.landmarks_quantization_meta = HiggsQuantizationMeta.from_config('2bit', head_dim=self.head_dim, device=self.device, dtype=self.dtype)
+            self.landmarks_quantization_meta = HiggsQuantizationMeta.from_config(
+                "2bit", head_dim=self.head_dim, device=self.device, dtype=self.dtype
+            )
             self.landmarks_buffer = QuantizedTensor(
                 idx=torch.zeros(
                     (
@@ -180,10 +191,12 @@ class ShadowKVPool:
         # KV-allocation
         self._kv_cache_dtype = self.dtype
         self.kv_cache_headdim = self.head_dim
-        _kv_cache_device = self.device if not self.config.enable_offloading else 'cpu'
+        _kv_cache_device = self.device if not self.config.enable_offloading else "cpu"
 
         if self.config.quantize_kvcache:
-            self.kvcache_quantization_meta = HiggsQuantizationMeta.from_config('4bit', head_dim=self.head_dim, dtype=self.dtype, device=self.device)
+            self.kvcache_quantization_meta = HiggsQuantizationMeta.from_config(
+                "4bit", head_dim=self.head_dim, dtype=self.dtype, device=self.device
+            )
             self._kv_cache_dtype = self.kvcache_quantization_meta.idx_dtype
             self.kv_cache_headdim = self.kvcache_quantization_meta.quantized_head_dim
 
@@ -196,7 +209,7 @@ class ShadowKVPool:
                     self.local_kv_heads,
                 ),
                 device=self.device,
-                dtype=self.kvcache_quantization_meta.scales_dtype
+                dtype=self.kvcache_quantization_meta.scales_dtype,
             ).contiguous()
 
             self.dequantized_kvcache_buffer = torch.empty(
@@ -219,7 +232,7 @@ class ShadowKVPool:
                     self.local_kv_heads,
                 ),
                 device=self.device,
-                dtype=self.kvcache_quantization_meta.scales_dtype
+                dtype=self.kvcache_quantization_meta.scales_dtype,
             ).contiguous()
 
             # per-slot token counts consumed by higgs_quantize_heads / higgs_dequantize_heads
@@ -232,9 +245,9 @@ class ShadowKVPool:
             )
             # on decode the flat (max_batch_size * max_seq_len) cache is treated as
             # max_batch_size * max_seq_len slots of one token each (zero-storage expand)
-            self._flat_ones = torch.ones(
-                (1,), dtype=torch.int32, device=self.device
-            ).expand(max_batch_size * max_seq_len)
+            self._flat_ones = torch.ones((1,), dtype=torch.int32, device=self.device).expand(
+                max_batch_size * max_seq_len
+            )
 
         # NOTE: do NOT use pin_memory=True here. Pinning ~9 GiB in a single
         # cudaHostAlloc call fails with cudaErrorInvalidValue on hosts with
@@ -254,9 +267,10 @@ class ShadowKVPool:
             dtype=self._kv_cache_dtype,
         ).contiguous()
 
-
         if self.config.enable_offloading:
-            logger.debug(f"Mapping kv cache on gpu ({_kv_cache_device, self._kv_cache_dtype, self.full_kv_buffer.shape})")
+            logger.debug(
+                f"Mapping kv cache on gpu ({_kv_cache_device, self._kv_cache_dtype, self.full_kv_buffer.shape})"
+            )
             self.full_kv_buffer = map_to_gpu(self.full_kv_buffer)
 
         logger.info(
@@ -304,7 +318,14 @@ class ShadowKVPool:
             dim=0,
         ).to(dtype=torch.int32)
 
-    def store_kv(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, is_prefill: bool = False, batch_indices: torch.Tensor = None):
+    def store_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int,
+        is_prefill: bool = False,
+        batch_indices: torch.Tensor = None,
+    ):
         if self.config.quantize_kvcache:
             assert batch_indices is not None
             num_tokens = k.shape[0]
@@ -443,6 +464,10 @@ class ShadowKVPool:
             )
 
     def prepare_shadowkv_metadata(self, seqlens: list[int], batch_indices: list[int]):
+        sparse_budget_is_absolute = self.config.sparse_budget_is_absolute
+        sparse_chunks_ratio = 0.0 if sparse_budget_is_absolute else float(self.config.sparse_budget)
+        sparse_chunks_budget = int(self.config.sparse_budget) if sparse_budget_is_absolute else 0
+
         fill_prefill_metadata(
             self.prefix_lens,
             self.infix_lens,
@@ -452,10 +477,12 @@ class ShadowKVPool:
                 device=self.device, dtype=torch.int32, non_blocking=True
             ),
             self.config.prefix_budget,
-            self.config.sparse_budget,
+            sparse_chunks_ratio,
             self.config.suffix_budget,
             self.config.min_seqlen_to_prune,
             self.config.chunk_size,
+            sparse_chunks_budget,
+            sparse_budget_is_absolute,
         )
         self.prefix_end_indices = self.prefix_lens.cpu().tolist()
         self.suffix_start_indices = (self.prefix_lens.cpu() + self.infix_lens.cpu()).tolist()
@@ -626,11 +653,11 @@ class ShadowKVPool:
                 self.config.chunk_size,
             )
 
-            for i in range(2): # for K and V respectively
+            for i in range(2):  # for K and V respectively
                 higgs_dequantize_heads(
                     quantized=QuantizedTensor(
                         idx=self.gathered_kv_buffer[i],
-                        scales=self.gathered_quantized_kv_cache_scales[i]
+                        scales=self.gathered_quantized_kv_cache_scales[i],
                     ),
                     lengths=self._slot_pruned_seq_lens,
                     grid=self.kvcache_quantization_meta.grid,

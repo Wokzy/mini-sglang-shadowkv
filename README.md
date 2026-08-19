@@ -60,9 +60,9 @@ additional_config.json
 ```
 
 #### `shadowkv_config` options:
-   - `min_seqlen_to_prune`: requests won't be pruned to less than min_seqlen_to_prune tokens. Make sure it does not clash with your budgets (`min_seqlen_to_prune` must be less or equal to `max_seq_len * total_budget`)
+   - `min_seqlen_to_prune`: in fractional sparse-budget mode, requests won't be pruned to fewer than this many tokens. Make sure it does not clash with your ratio budgets (`min_seqlen_to_prune` must be less than or equal to `max_seq_len * total_budget`). Absolute sparse budgets take precedence over this setting.
    - `prefix_budget`: proportion of prefix input tokens that is always gathered
-   - `sparse_budget`: proportion of selected tokens
+   - `sparse_budget`: selected sparse budget. A float is a proportion of request tokens (for example, `0.015625`); an integer is an absolute number of chunks selected for every request (for example, `2048`). If fewer chunks are available, all of them are selected.
    - `suffix_budget`: proportion of suffix input tokens that is always gathered
    - `chunk_size`: Landmarks chunk size (YAKV proposes chunk size 1)
    - `quantize_landmarks`: Enable 2-bit HIGGS qunatization of landmarks
