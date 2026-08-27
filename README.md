@@ -5,7 +5,6 @@
    - page_size == 1
    - no cuda graph
    - `--cache-type` naive
-   - Model `head-dim` 128
 
 ## Installation:
 

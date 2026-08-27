@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from minisgl.models.config import ModelConfig
 from minisgl.distributed import get_tp_info
-from minisgl.utils import div_even, init_logger
+from minisgl.utils import div_even, init_logger, print_object_cuda_tensors_capacity
 
 from minisgl.kernel.shadowkv import (
     shadowkv_gather_scales_kernel,
@@ -115,7 +115,9 @@ class ShadowKVPool:
                 f"ShadowkvPool: Allocated {(self.landmarks_buffer.numel() * self.landmarks_buffer.element_size()) / 2**30:.2f} GiB for Landmarks ({self.dtype})"
             )
         else:
-            self.landmarks_quantization_meta = HiggsQuantizationMeta.from_config('2bit', head_dim=self.head_dim, device=self.device, dtype=self.dtype)
+            self.landmarks_quantization_meta = HiggsQuantizationMeta.from_config(
+                "2bit", head_dim=self.head_dim, device=self.device, dtype=self.dtype
+            )
             self.landmarks_buffer = QuantizedTensor(
                 idx=torch.zeros(
                     (
@@ -146,8 +148,6 @@ class ShadowKVPool:
             ) / 2**30
 
             logger.info(f"ShadowkvPool: Allocated {__allocated_space:.2f} GiB for 2-bit Landmarks")
-
-        assert self.model_config.head_dim == 128, "Supported head dims are: [128]"
 
         self.prefix_lens = torch.empty((max_batch_size,), dtype=torch.int32, device=self.device)
         self.infix_lens = torch.empty((max_batch_size,), dtype=torch.int32, device=self.device)
@@ -180,10 +180,12 @@ class ShadowKVPool:
         # KV-allocation
         self._kv_cache_dtype = self.dtype
         self.kv_cache_headdim = self.head_dim
-        _kv_cache_device = self.device if not self.config.enable_offloading else 'cpu'
+        _kv_cache_device = self.device if not self.config.enable_offloading else "cpu"
 
         if self.config.quantize_kvcache:
-            self.kvcache_quantization_meta = HiggsQuantizationMeta.from_config('4bit', head_dim=self.head_dim, dtype=self.dtype, device=self.device)
+            self.kvcache_quantization_meta = HiggsQuantizationMeta.from_config(
+                "4bit", head_dim=self.head_dim, dtype=self.dtype, device=self.device
+            )
             self._kv_cache_dtype = self.kvcache_quantization_meta.idx_dtype
             self.kv_cache_headdim = self.kvcache_quantization_meta.quantized_head_dim
 
@@ -196,7 +198,7 @@ class ShadowKVPool:
                     self.local_kv_heads,
                 ),
                 device=self.device,
-                dtype=self.kvcache_quantization_meta.scales_dtype
+                dtype=self.kvcache_quantization_meta.scales_dtype,
             ).contiguous()
 
             self.dequantized_kvcache_buffer = torch.empty(
@@ -219,7 +221,7 @@ class ShadowKVPool:
                     self.local_kv_heads,
                 ),
                 device=self.device,
-                dtype=self.kvcache_quantization_meta.scales_dtype
+                dtype=self.kvcache_quantization_meta.scales_dtype,
             ).contiguous()
 
             # per-slot token counts consumed by higgs_quantize_heads / higgs_dequantize_heads
@@ -232,15 +234,10 @@ class ShadowKVPool:
             )
             # on decode the flat (max_batch_size * max_seq_len) cache is treated as
             # max_batch_size * max_seq_len slots of one token each (zero-storage expand)
-            self._flat_ones = torch.ones(
-                (1,), dtype=torch.int32, device=self.device
-            ).expand(max_batch_size * max_seq_len)
+            self._flat_ones = torch.ones((1,), dtype=torch.int32, device=self.device).expand(
+                max_batch_size * max_seq_len
+            )
 
-        # NOTE: do NOT use pin_memory=True here. Pinning ~9 GiB in a single
-        # cudaHostAlloc call fails with cudaErrorInvalidValue on hosts with
-        # fragmented physical memory (the NVIDIA driver needs large contiguous
-        # kernel allocations for the DMA mapping of one huge range).
-        # map_to_gpu() instead page-locks the buffer in small chunks.
         self.full_kv_buffer = torch.empty(
             (
                 2,
@@ -254,9 +251,10 @@ class ShadowKVPool:
             dtype=self._kv_cache_dtype,
         ).contiguous()
 
-
         if self.config.enable_offloading:
-            logger.debug(f"Mapping kv cache on gpu ({_kv_cache_device, self._kv_cache_dtype, self.full_kv_buffer.shape})")
+            logger.debug(
+                f"Mapping kv cache on gpu ({_kv_cache_device, self._kv_cache_dtype, self.full_kv_buffer.shape})"
+            )
             self.full_kv_buffer = map_to_gpu(self.full_kv_buffer)
 
         logger.info(
@@ -304,7 +302,16 @@ class ShadowKVPool:
             dim=0,
         ).to(dtype=torch.int32)
 
-    def store_kv(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, is_prefill: bool = False, batch_indices: torch.Tensor = None):
+        logger.debug(print_object_cuda_tensors_capacity(self))
+
+    def store_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int,
+        is_prefill: bool = False,
+        batch_indices: torch.Tensor = None,
+    ):
         if self.config.quantize_kvcache:
             assert batch_indices is not None
             num_tokens = k.shape[0]
@@ -328,8 +335,7 @@ class ShadowKVPool:
             else:
                 # Decode: treat the cache as (max_batch_size * max_seq_len) one-token slots
                 # and quantize each new token directly into its flat row
-                # (batch_idx * max_seq_len + seq_len - 1) -- both codes AND scales land in
-                # place, so no extra store/scatter pass is needed.
+                # (batch_idx * max_seq_len + seq_len - 1)
                 x_k = k.reshape(num_tokens, 1, self.local_kv_heads, self.head_dim).contiguous()
                 x_v = v.reshape(num_tokens, 1, self.local_kv_heads, self.head_dim).contiguous()
                 lengths = self._flat_ones
@@ -473,18 +479,11 @@ class ShadowKVPool:
             out=self.num_chunks_to_select,
         )
 
-        # self.num_chunks_to_select = self.pruned_infix_lens // self.config.chunk_size
-
-        # self.num_chunks_to_select = (
-        #     self.pruned_infix_lens.cpu() // self.config.chunk_size
-        # ).tolist()
-
         self.store_cache_indices = (
             torch.arange(0, seqlens[0]) + (batch_indices[0] * self.max_seq_len)
         ).to(device=self.device, dtype=torch.int32, non_blocking=True)
 
         if self.config.quantize_kvcache:
-            # per-slot full sequence length, consumed by higgs_quantize_heads on prefill
             self._slot_seq_lens[batch_indices[0]] = seqlens[0]
 
     def prepare_decode_metadata(self, seqlens: list[int], batch_indices: list[int]):
@@ -504,9 +503,6 @@ class ShadowKVPool:
             self.pruned_seq_lens,
             self.cu_pruned_seq_lens,
         )
-
-        # for i, batch_idx in enumerate(batch_indices):
-        #     self.seqlens[batch_idx] = seqlens[i]
 
         self.store_cache_indices = torch.tensor(
             [
@@ -531,9 +527,6 @@ class ShadowKVPool:
     def select_kv(
         self,
         query_states: torch.Tensor,
-        # page_table: torch.Tensor,
-        # k_cache: torch.Tensor,
-        # v_cache: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         BS, num_qo_heads, HD = query_states.shape
@@ -577,22 +570,6 @@ class ShadowKVPool:
             batch_indices=self.batch_indices[:BS],
             out=self.selected_chunks,
         )
-        # for i in range(BS):
-        #     batch_idx = self._cpu_batch_indices[i]
-        #     num_selected_chunks = self.num_chunks_to_select[batch_idx]
-        #     # logger.info_rank0(f"num_selected_chunks: {num_selected_chunks}")
-        #     if num_selected_chunks == 0:
-        #         continue
-
-        #     torch.topk(
-        #         self.scores[batch_idx, :, : self.total_num_chunks[batch_idx]],
-        #         k=num_selected_chunks,
-        #         sorted=False,
-        #         out=(
-        #             self._topk_values_buffer[:, :num_selected_chunks],
-        #             self.selected_chunks[batch_idx, :, :num_selected_chunks],
-        #         ),
-        #     )
 
         gather_kv_cache(
             self.prefix_lens,
@@ -610,8 +587,6 @@ class ShadowKVPool:
         )
 
         if self.config.quantize_kvcache:
-            # gather the per-(token, head) scales exactly like gather_kv_cache gathers
-            # the quantized codes (prefix / selected sparse chunks / suffix)
             shadowkv_gather_scales_kernel(
                 self.prefix_lens,
                 self.infix_lens,
@@ -626,11 +601,11 @@ class ShadowKVPool:
                 self.config.chunk_size,
             )
 
-            for i in range(2): # for K and V respectively
+            for i in range(2):  # for K and V respectively
                 higgs_dequantize_heads(
                     quantized=QuantizedTensor(
                         idx=self.gathered_kv_buffer[i],
-                        scales=self.gathered_quantized_kv_cache_scales[i]
+                        scales=self.gathered_quantized_kv_cache_scales[i],
                     ),
                     lengths=self._slot_pruned_seq_lens,
                     grid=self.kvcache_quantization_meta.grid,
@@ -643,4 +618,3 @@ class ShadowKVPool:
             return self.dequantized_kvcache_buffer[0], self.dequantized_kvcache_buffer[1]
 
         return self.gathered_kv_buffer[0], self.gathered_kv_buffer[1]
-        # return self.full_kv_buffer[0, layer_idx], self.full_kv_buffer[1, layer_idx]
