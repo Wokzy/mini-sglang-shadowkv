@@ -1,3 +1,101 @@
+# ArkVale
+
+[ArkVale](https://github.com/pku-liang/ArkVale) uses query-dependent key-page
+scores to keep a bounded GPU KV cache and recall evicted pages from CPU.
+This integration is separate from YAKV/ShadowKV. Its implementation and Triton
+kernels live in [`python/minisgl/kernel/arkvale/`](python/minisgl/kernel/arkvale/).
+See [reference and implementation scope](python/minisgl/kernel/arkvale/REFERENCE.md)
+for the pinned upstream reference and differences.
+
+## Install and launch
+
+Use the repository's normal CUDA/PyTorch installation below (`pip install -e .
+--no-build-isolation` in an existing environment). ArkVale's Triton kernels compile
+on first use; no separate upstream ArkVale extension or FlashInfer fork is needed.
+The existing repository-wide build/dependency requirements still apply. Ensure
+`nvcc` is on `PATH` and `CUDA_HOME` points to your CUDA toolkit before launch;
+Mini-SGLang's existing JIT kernels need the toolkit even when ArkVale uses Triton.
+
+Initial supported runtime: FP16/BF16, tensor parallel size 1, scheduler page size
+1, naive cache, no CUDA graphs, no overlap scheduling, and no chunked prefill.
+Set maximum prefill length at least as large as maximum sequence length.
+Unsupported combinations fail at startup. Model head dimensions up to 256 are
+supported by the ArkVale kernels (the model's own RoPE constraints still apply).
+
+```bash
+export MINISGL_DISABLE_OVERLAP_SCHEDULING=1
+python -m minisgl \
+    --model Qwen/Qwen3-0.6B \
+    --additional-config-path arkvale_config.json \
+    --attention-backend arkvale \
+    --cache-type naive --page-size 1 --graph 0 --tp-size 1 \
+    --max-running-requests 2 \
+    --max-seq-len-override 4096 --max-prefill-length 4096 \
+    --memory-ratio 0.5 \
+    --host 127.0.0.1 --port 1919
+```
+
+[`arkvale_config.json`](arkvale_config.json):
+
+```json
+{
+  "arkvale_config": {
+    "enabled": true,
+    "page_size": 32,
+    "page_budget": 32,
+    "page_topk": 16,
+    "sink_pages": 2,
+    "window_pages": 2,
+    "max_cpu_bytes": 8589934592
+  }
+}
+```
+
+- `page_size`: internal ArkVale tokens per page, a power of two from 1 to 128.
+  Independent of scheduler `--page-size`, which must remain 1.
+- `page_budget`: maximum GPU-resident pages **per request, per layer**.
+- `page_topk`: total pages requested per decode step, **including** protected
+  sink/window pages. Must satisfy
+  `sink_pages + window_pages < page_topk <= page_budget`.
+  Other resident pages are retained until space is needed; attention uses all
+  resident pages, matching upstream's default non-sparse-attention mode.
+- `sink_pages` / `window_pages`: always retain the first / most recent pages.
+  Sink may be zero; window must be at least two pages.
+- `max_cpu_bytes`: total pinned CPU backing-store budget. Each live request
+  reserves `2 * layers * ceil(max_seq_len / page_size) * page_size * KV_heads *
+  head_dim * dtype_bytes`. Allocation is lazy and released on completion/abort.
+  Startup checks require enough budget for all configured running requests.
+
+GPU storage is bounded by resident KV pages plus small per-page GPU digests.
+`--memory-ratio` bounds this worst-case cache allocation against free memory
+following model loading; leave extra memory for prefill and model activations.
+`--num-pages`, if supplied, controls **logical scheduler token capacity**, not
+ArkVale GPU residency; normally leave it unset. Do not enable ShadowKV in the
+same JSON file. Prefill is exact; decode becomes approximate above `page_budget *
+page_size` tokens. This version uses synchronous CPU/GPU copies and one shared
+selection across KV heads; it does not implement upstream asynchronous prefetch,
+quantization, or per-layer budgets.
+
+## Validate and stop
+
+```bash
+python -m pytest -q tests/kernel/test_arkvale.py tests/arkvale
+# In another terminal after the server is ready:
+python tests/arkvale/smoke_server.py --base-url http://127.0.0.1:1919
+```
+
+The smoke client checks five sequential/concurrent requests, nonempty responses,
+streaming cancellation, and slot reuse. Long requests deliberately ignore EOS to
+exercise page-boundary transitions; short requests use normal EOS termination. With the example small page budget, its long prompts exercise
+scoring and recall. Check server `ArkVale request ... released` logs for nonzero
+`score_steps` and `evictions`, and confirm there are no CUDA errors or tracebacks.
+`recalls` counts CPU-to-GPU page loads, including initial fills. The server must
+finish requests normally, not merely return a healthy readiness endpoint.
+
+Stop the foreground server with **Ctrl-C** after validation and wait for workers
+to exit. If launching in a background process group, retain its process-group ID
+and terminate only that group; never kill unrelated inference processes.
+
 # YAKV
 
 ## Prerequisites

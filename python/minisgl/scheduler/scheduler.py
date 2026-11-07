@@ -198,6 +198,11 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        from minisgl.kernel.arkvale.cache import ArkValePool
+
+        if isinstance(self.engine.ctx.kv_cache, ArkValePool):
+            stats = self.engine.ctx.kv_cache.release(req.uid)
+            logger.info_rank0(f"ArkVale request {req.uid} released: {stats}")
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 

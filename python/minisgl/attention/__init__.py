@@ -41,6 +41,13 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("arkvale")
+def create_arkvale_backend(config: ModelConfig):
+    from minisgl.kernel.arkvale.backend import ArkValeBackend
+
+    return ArkValeBackend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]

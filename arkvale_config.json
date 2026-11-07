@@ -1,0 +1,11 @@
+{
+  "arkvale_config": {
+    "enabled": true,
+    "page_size": 32,
+    "page_budget": 32,
+    "page_topk": 16,
+    "sink_pages": 2,
+    "window_pages": 2,
+    "max_cpu_bytes": 8589934592
+  }
+}

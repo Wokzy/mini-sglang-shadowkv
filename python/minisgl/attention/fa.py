@@ -13,9 +13,21 @@ from .utils import BaseCaptureData
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
-from flash_attn_interface import flash_attn_with_kvcache as flash3_kvcache_impl
+try:
+    from flash_attn_interface import flash_attn_with_kvcache as flash3_kvcache_impl
+except ImportError:
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-# from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash3_kvcache_impl
+    def flash3_kvcache_impl(q, k_cache, v_cache, *, cache_batch_idx=None, **kwargs):
+        version = 4 if is_sm100_supported() else 3
+        if version == 4 and cache_batch_idx is not None:
+            # FA4 requires cache batches to be in query order.
+            k_cache = k_cache.index_select(0, cache_batch_idx)
+            v_cache = v_cache.index_select(0, cache_batch_idx)
+            cache_batch_idx = None
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache, cache_batch_idx=cache_batch_idx, ver=version, **kwargs
+        )
 
 
 @dataclass

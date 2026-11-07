@@ -58,7 +58,20 @@ class Engine:
 
         assert config.page_size == 1
 
-        if config.shadowkv_config is not None and config.shadowkv_config.enabled:
+        if config.arkvale_config is not None and config.arkvale_config.enabled:
+            from minisgl.kernel.arkvale.cache import ArkValePool
+
+            self.ctx.kv_cache = self.kv_cache = ArkValePool(
+                config=config.arkvale_config,
+                model_config=config.model_config,
+                max_seq_len=config.max_seq_len,
+                device=self.device,
+                dtype=self.dtype,
+                max_requests=config.max_running_req,
+                memory_ratio=config.memory_ratio,
+            )
+            logger.info_rank0("ArkVale enabled: bounded GPU pages with pinned CPU backing")
+        elif config.shadowkv_config is not None and config.shadowkv_config.enabled:
             self.ctx.kv_cache = ShadowKVPool(
                 config=config.shadowkv_config,
                 model_config=config.model_config,
@@ -161,6 +174,10 @@ class Engine:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        if config.arkvale_config is not None and config.arkvale_config.enabled:
+            # These scheduler slots account for logical tokens, not resident KV.
+            # GPU KV is lazily allocated by ArkVale, capped per request/layer.
+            return config.num_page_override or config.max_seq_len * config.max_running_req
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
