@@ -13,9 +13,11 @@ from .utils import BaseCaptureData
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
-from flash_attn_interface import flash_attn_with_kvcache as flash3_kvcache_impl
 
-# from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash3_kvcache_impl
+def flash3_kvcache_impl(*args, **kwargs):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    return flash_attn_with_kvcache(*args, **kwargs)
 
 
 @dataclass
@@ -33,6 +35,7 @@ class FAMetadata(BaseAttnMetadata):
 
     page_table: torch.Tensor
     cache_batch_idx: torch.Tensor
+    fa4_page_table: torch.Tensor | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -51,13 +54,24 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.version = 4 if is_sm100_supported() else 3
 
         self.shadowkv_enabled = ctx.shadowkv_enabled
+        if self.shadowkv_enabled and self.version == 4:
+            if self.kvcache.max_seq_len % 128:
+                raise ValueError("YAKV with FA4 requires max_seq_len divisible by 128")
+            pages = self.kvcache.max_seq_len // 128
+            self.fa4_slot_pages = torch.arange(
+                self.kvcache.max_batch_size * pages,
+                dtype=torch.int32,
+                device=self.kvcache.device,
+            ).view(self.kvcache.max_batch_size, pages)
 
     def flash3_kvcache_forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ):
         metadata: FAMetadata = batch.attn_metadata
         cache_batch_idx = metadata.cache_batch_idx
-        self.kvcache.store_kv(k, v, layer_id, is_prefill=batch.is_prefill, batch_indices=cache_batch_idx)
+        self.kvcache.store_kv(
+            k, v, layer_id, is_prefill=batch.is_prefill, batch_indices=cache_batch_idx
+        )
 
         if batch.is_prefill:
             q_flash = q.view(1, q.shape[0], self.kvcache.local_qo_heads, self.config.head_dim)
@@ -70,11 +84,31 @@ class FlashAttentionBackend(BaseAttnBackend):
             v_cache = v.view(1, v.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
         else:
             q_flash = q.view(
-                metadata.cache_batch_idx.shape[0], 1, self.kvcache.local_qo_heads, self.config.head_dim
+                metadata.cache_batch_idx.shape[0],
+                1,
+                self.kvcache.local_qo_heads,
+                self.config.head_dim,
             )
             k_cache, v_cache = self.kvcache.select_kv(
                 q,
                 layer_id,
+            )
+
+        if self.version == 4:
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+            if batch.is_prefill:
+                return flash_attn_with_kvcache(q_flash, k_cache, v_cache, causal=True, ver=4)
+            # FA4 addresses request slots via 128-token pages; views avoid KV copies.
+            return flash_attn_with_kvcache(
+                q,
+                k_cache.view(-1, 128, k_cache.shape[-2], k_cache.shape[-1]),
+                v_cache.view(-1, 128, v_cache.shape[-2], v_cache.shape[-1]),
+                page_table=metadata.fa4_page_table,
+                cache_seqlens=metadata.cache_seqlens,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                causal=True,
+                ver=4,
             )
 
         return flash3_kvcache_impl(
@@ -169,6 +203,11 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
             page_table=new_page_table,
+            fa4_page_table=(
+                self.fa4_slot_pages[batch_indices]
+                if self.shadowkv_enabled and self.version == 4
+                else None
+            ),
             cache_batch_idx=torch.Tensor(batch_indices).to(
                 device=self.kvcache.device, dtype=torch.int32, non_blocking=True
             ),
@@ -194,11 +233,21 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_k=capture.page_table.size(1) * self.page_size,
             max_seqlen_q=1,  # decode only
             page_table=capture.page_table[:bs, :],
+            fa4_page_table=(
+                self.fa4_slot_pages[batch_indices]
+                if self.shadowkv_enabled and self.version == 4
+                else None
+            ),
             cache_batch_idx=torch.Tensor(batch_indices).to(
                 device=self.kvcache.device, dtype=torch.int32, non_blocking=True
             ),
         )
         batch.attn_metadata = metadata
+
+        if self.shadowkv_enabled and self.version == 4:
+            if not hasattr(self, "fa4_capture_metadata"):
+                self.fa4_capture_metadata = {}
+            self.fa4_capture_metadata[bs] = batch.attn_metadata
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
@@ -208,6 +257,11 @@ class FlashAttentionBackend(BaseAttnBackend):
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
+        if self.shadowkv_enabled and self.version == 4:
+            # Graphs retain the capture table's address, so update it in place.
+            capture_metadata = getattr(self, "fa4_capture_metadata", {}).get(bs)
+            if capture_metadata is not None:
+                capture_metadata.fa4_page_table.copy_(metadata.fa4_page_table)
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)
 
 
@@ -237,6 +291,23 @@ def _fa_sgl_impl(
     #         "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
     #     ) from e
 
+    if version == 4:
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            pack_gqa=pack_gqa,
+            ver=4,
+        )
     return flash3_kvcache_impl(  # type: ignore
         q=q,
         k_cache=k_cache,

@@ -1,0 +1,12 @@
+{
+  "magicpig_config": {
+    "hash_bits": 10,
+    "hash_tables": 150,
+    "sink_tokens": 4,
+    "local_tokens": 64,
+    "generation_buffer": 1024,
+    "dense_layers": [0, 16, 32, 48, 64],
+    "seed": 42,
+    "hash_chunk_size": 1024
+  }
+}

@@ -10,6 +10,7 @@ __pycache__/
 # json files
 *.json
 *.jsonl
+!benchmark/configs/magicpig.json
 
 # profiling data
 *.nsys-rep
@@ -31,3 +32,6 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# Optional MagicPIG native build (documented default location)
+/work/magicpig-native/

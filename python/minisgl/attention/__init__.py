@@ -13,8 +13,7 @@ logger = init_logger(__name__)
 
 
 class BackendCreator(Protocol):
-    def __call__(self, config: ModelConfig) -> BaseAttnBackend:
-        ...
+    def __call__(self, config: ModelConfig) -> BaseAttnBackend: ...
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -39,6 +38,13 @@ def create_fa_backend(config: ModelConfig):
     from .fa import FlashAttentionBackend
 
     return FlashAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register("magicpig")
+def create_magicpig_backend(config: ModelConfig):
+    from .magicpig import MagicPIGBackend
+
+    return MagicPIGBackend(config)
 
 
 def validate_attn_backend(backend: str, allow_auto: bool = True):
@@ -69,8 +75,7 @@ def create_attention_backend(
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
 
 
-from .shadowkv import ShadowKVPool, ShadowKVConfig
-
+from .shadowkv import ShadowKVConfig, ShadowKVPool
 
 __all__ = [
     "BaseAttnMetadata",

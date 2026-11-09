@@ -1,5 +1,9 @@
 # YAKV
 
+## MagicPIG baseline
+
+The optional `magicpig` attention backend uses the official CPU LSH/attention kernels with GPU local attention. See [build, configuration and comparison instructions](docs/magicpig.md).
+
 ## Prerequisites
    - `flash_attn` installed
    - page_size == 1

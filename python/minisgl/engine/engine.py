@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
-from minisgl.attention import create_attention_backend, ShadowKVConfig, ShadowKVPool
+from minisgl.attention import ShadowKVPool, create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
@@ -54,11 +54,21 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        
 
         assert config.page_size == 1
 
-        if config.shadowkv_config is not None and config.shadowkv_config.enabled:
+        if config.magicpig_config is not None:
+            from minisgl.attention.magicpig import MagicPIGPool
+
+            self.ctx.kv_cache = self.kv_cache = MagicPIGPool(
+                config.magicpig_config,
+                config.model_config,
+                config.max_running_req,
+                config.max_seq_len,
+                self.device,
+                self.dtype,
+            )
+        elif config.shadowkv_config is not None and config.shadowkv_config.enabled:
             self.ctx.kv_cache = ShadowKVPool(
                 config=config.shadowkv_config,
                 model_config=config.model_config,
@@ -70,12 +80,12 @@ class Engine:
             self.ctx.shadowkv_enabled = True
         else:
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                page_size=config.page_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -161,6 +171,16 @@ class Engine:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        if config.magicpig_config is not None:
+            # Page IDs only account for scheduler capacity; no full GPU KV pool is allocated.
+            pages = (
+                config.num_page_override
+                if config.num_page_override is not None
+                else config.max_running_req * config.max_seq_len
+            )
+            if pages < config.max_seq_len:
+                raise ValueError("MagicPIG num_pages must be at least max_seq_len")
+            return pages
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -233,6 +253,13 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.magicpig_config is not None:
+        if config.model_config.head_dim != 128:
+            raise ValueError("MagicPIG native kernels require head_dim=128")
+        if getattr(config, "max_extend_tokens", config.max_seq_len) < config.max_seq_len:
+            raise ValueError("MagicPIG requires --max-prefill-length >= --max-seq-len-override")
+        logger.info_rank0("MagicPIG: CUDA graphs disabled; CPU/GPU native attention enabled")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
