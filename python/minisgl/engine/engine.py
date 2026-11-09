@@ -12,6 +12,7 @@ from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.og_shadowkv import ShadowKVCache_CPU
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -67,7 +68,17 @@ class Engine:
                 device=self.device,
                 dtype=self.dtype,
             )
-            self.ctx.shadowkv_enabled = True
+            self.ctx.shadowkv_enabled = "YAKV"
+        elif config.og_shadowkv_config is not None and config.og_shadowkv_config.enabled:
+            self.ctx.kv_cache = ShadowKVCache_CPU(
+                config=config.model_config,
+                shadowkv_config=config.og_shadowkv_config,
+                batch_size=config.max_running_req + 1,
+                max_length=config.max_seq_len,
+                device=self.device,
+                dtype=self.dtype
+            )
+            self.ctx.shadowkv_enabled = "OGShadowKV"
         else:
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,

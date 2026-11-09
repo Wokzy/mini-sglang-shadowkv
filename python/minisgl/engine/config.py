@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
 from minisgl.attention import ShadowKVConfig
+from minisgl.og_shadowkv import OGShadowKVConfig
 
 
 @dataclass(frozen=False)
@@ -46,6 +47,8 @@ class EngineConfig:
                 shadowkv_config_dict := additional_config_dict.get("shadowkv_config", None)
             ) is not None:
                 self.shadowkv_config = ShadowKVConfig.from_dict(shadowkv_config_dict)
+            elif (og_shadowkv_config_dict := additional_config_dict.get("og_shadowkv_config", None)) is not None:
+                self.og_shadowkv_config = OGShadowKVConfig.from_dict(og_shadowkv_config_dict)
 
     @cached_property
     def hf_config(self):

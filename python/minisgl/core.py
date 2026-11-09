@@ -104,7 +104,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: Any = field(init=False)
-    shadowkv_enabled: bool = field(default=False, init=False)
+    shadowkv_enabled: str | None = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property
