@@ -19,6 +19,7 @@
 
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -205,9 +206,9 @@ void batch_gather_gemm(
     CUTLASS_CHECK(status);
 
     // Initialize CUTLASS kernel with arguments and workspace pointer
-    status = gemm_op.initialize(arguments, workspace.get());
+    status = gemm_op.initialize(arguments, workspace.get(), at::cuda::getCurrentCUDAStream());
     CUTLASS_CHECK(status);
 
-    status = gemm_op();
+    status = gemm_op(at::cuda::getCurrentCUDAStream());
     CUTLASS_CHECK(status);
 }

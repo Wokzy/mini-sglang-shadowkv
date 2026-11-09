@@ -55,7 +55,6 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        
 
         assert config.page_size == 1
 
@@ -76,17 +75,17 @@ class Engine:
                 batch_size=config.max_running_req + 1,
                 max_length=config.max_seq_len,
                 device=self.device,
-                dtype=self.dtype
+                dtype=self.dtype,
             )
             self.ctx.shadowkv_enabled = "OGShadowKV"
         else:
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                page_size=config.page_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -244,6 +243,22 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.og_shadowkv_config and config.og_shadowkv_config.enabled:
+        if config.tp_info.size != 1:
+            raise ValueError("Original ShadowKV requires --tp-size 1")
+        if config.attention_backend == "auto":
+            override("attention_backend", "fa")
+        if config.attention_backend not in ("fa", "fa,fa"):
+            raise ValueError("Original ShadowKV supports only --attention-backend fa,fa")
+        if getattr(config, "cache_type", "naive") != "naive":
+            raise ValueError("Original ShadowKV requires --cache-type naive")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        # The current scheduler does not resume chunked prefills. Original
+        # ShadowKV also needs the full prompt for its sequence-specific SVD.
+        if hasattr(config, "max_extend_tokens"):
+            override("max_extend_tokens", max(config.max_extend_tokens, config.max_seq_len))
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

@@ -26,16 +26,16 @@
 import torch
 from torch.nn import functional as F
 
-from flashinfer.norm import rmsnorm
 # from minference import vertical_slash_sparse_attention, block_sparse_attention, streaming_forward
 
-from minisgl.og_shadowkv_kernels import shadowkv
+from minisgl import og_shadowkv_kernels as shadowkv
 
 def layer_norm(
     hidden_states: torch.Tensor,
     eps: float,
     w: torch.Tensor,
 ):
+    from flashinfer.norm import rmsnorm
     return rmsnorm(hidden_states.view(-1, hidden_states.size(-1)), w, eps).view_as(hidden_states)
 
 # def layer_norm(
@@ -53,9 +53,6 @@ def layer_norm(
 
 # copy from https://github.com/microsoft/MInference/blob/main/minference/modules/minference_forward.py
 
-last_q = 64
-arange = torch.arange(last_q, device="cuda")
-LAST_Q_MASK = arange[None, None, :, None] >= arange[None, None, None, :]
 
 def sum_all_diagonal_matrix(mat: torch.tensor):
     b, h, n, m = mat.shape
@@ -87,7 +84,9 @@ def gather_last_q_vertical_slash_topk_v4(q, k, v, head_id, minference_parttern):
         vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
         qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k)
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+        positions = torch.arange(last_q, device=q.device)
+        mask = positions[:, None] >= positions[None, :]
+        qk[:, :, :, -last_q:] = torch.where(mask, qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
         vertical[...,:30] = torch.inf

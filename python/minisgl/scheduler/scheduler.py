@@ -198,6 +198,8 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        if self.engine.ctx.shadowkv_enabled == "OGShadowKV":
+            self.engine.ctx.kv_cache.release_slot(req.table_idx)
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 

@@ -19,6 +19,7 @@
 
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <assert.h>
 #include <cuda_runtime.h>
@@ -193,5 +194,5 @@ void batch_gemm_softmax(
 
     CUTLASS_CHECK(batch_gemm_softmax.initialize(args));
 
-    CUTLASS_CHECK(batch_gemm_softmax());
+    CUTLASS_CHECK(batch_gemm_softmax(at::cuda::getCurrentCUDAStream()));
 }

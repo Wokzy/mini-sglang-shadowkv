@@ -19,6 +19,7 @@
 
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <vector>
 #include "functions.h"
@@ -70,7 +71,7 @@ void apply_rotary_pos_emb_new(
     const dim3 blocks(batch_size, heads, seq_len);
     const dim3 threads(half_dim);
 
-    apply_rotary_pos_emb_kernel<<<blocks, threads>>>(
+    apply_rotary_pos_emb_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
         position_ids.data_ptr<int64_t>(),
@@ -130,7 +131,7 @@ void apply_rotary_pos_emb_new_v2(
     const dim3 blocks(batch_size, heads, seq_len);
     const dim3 threads(half_dim);
 
-    apply_rotary_pos_emb_kernel_v2<<<blocks, threads>>>(
+    apply_rotary_pos_emb_kernel_v2<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
         position_ids.data_ptr<int32_t>(),
@@ -205,7 +206,7 @@ void apply_rotary_pos_emb_push_cache(
     const dim3 blocks(batch_size, heads, seq_len);
     const dim3 threads(half_dim);
 
-    apply_rotary_pos_emb_kernel_push_cache<<<blocks, threads>>>(
+    apply_rotary_pos_emb_kernel_push_cache<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
         position_ids.data_ptr<int32_t>(),
@@ -285,7 +286,7 @@ void apply_rotary_pos_emb_push_cache_opt(
     int half_dim, int chunk_size)
 {
 
-    apply_rotary_pos_emb_kernel_push_cache_opt<<<seq_len, heads * half_dim>>>(
+    apply_rotary_pos_emb_kernel_push_cache_opt<<<seq_len, heads * half_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
         position_ids.data_ptr<int32_t>(),
@@ -387,7 +388,7 @@ void apply_rotary_pos_emb_push_cache_opt_glm(
     int half_dim, int chunk_size)
 {
 
-    apply_rotary_pos_emb_kernel_push_cache_opt_glm<<<seq_len, heads * half_dim>>>(
+    apply_rotary_pos_emb_kernel_push_cache_opt_glm<<<seq_len, heads * half_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
         position_ids.data_ptr<int32_t>(),

@@ -61,27 +61,38 @@ class FlashAttentionBackend(BaseAttnBackend):
 
         match self.shadowkv_enabled:
             case "YAKV":
-                self.kvcache.store_kv(k, v, layer_id, is_prefill=batch.is_prefill, batch_indices=cache_batch_idx)
+                self.kvcache.store_kv(
+                    k, v, layer_id, is_prefill=batch.is_prefill, batch_indices=cache_batch_idx
+                )
 
                 if batch.is_prefill:
-                    q_flash = q.view(1, q.shape[0], self.kvcache.local_qo_heads, self.config.head_dim)
+                    q_flash = q.view(
+                        1, q.shape[0], self.kvcache.local_qo_heads, self.config.head_dim
+                    )
                     batch_indices = [req.table_idx for req in batch.padded_reqs]
                     cache_batch_idx = torch.Tensor([0]).to(
                         device=self.kvcache.device, dtype=torch.int32, non_blocking=True
                     )
                     self.kvcache.compute_and_store_landmarks(k, layer_id, batch_indices)
-                    k_cache = k.view(1, k.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
-                    v_cache = v.view(1, v.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim)
+                    k_cache = k.view(
+                        1, k.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim
+                    )
+                    v_cache = v.view(
+                        1, v.shape[0], self.kvcache.local_kv_heads, self.kvcache.head_dim
+                    )
                 else:
                     q_flash = q.view(
-                        metadata.cache_batch_idx.shape[0], 1, self.kvcache.local_qo_heads, self.config.head_dim
+                        metadata.cache_batch_idx.shape[0],
+                        1,
+                        self.kvcache.local_qo_heads,
+                        self.config.head_dim,
                     )
                     k_cache, v_cache = self.kvcache.select_kv(
                         q,
                         layer_id,
                     )
             case "OGShadowKV":
-                raise NotImplementedError
+                return self.og_shadowkv_forward(q, k, v, layer_id, batch)
             case _:
                 raise RuntimeError
 
@@ -93,6 +104,48 @@ class FlashAttentionBackend(BaseAttnBackend):
             cache_batch_idx=cache_batch_idx,
             causal=True,
         )
+
+    def og_shadowkv_forward(self, q, k, v, layer_id, batch):
+        h, d = self.config.num_kv_heads, self.config.head_dim
+        k, v = k.reshape(-1, h, d), v.reshape(-1, h, d)
+        pre_k = self.kvcache.take_pre_rope() if batch.is_prefill else None
+        outputs = []
+        offset = 0
+        for req in batch.reqs:
+            length = req.extend_len
+            qs, ks, vs = (
+                q[offset : offset + length],
+                k[offset : offset + length],
+                v[offset : offset + length],
+            )
+            if batch.is_prefill:
+                if req.cached_len:
+                    raise ValueError("Original ShadowKV requires a full prompt prefill")
+                self.kvcache.prefill(
+                    req.table_idx,
+                    layer_id,
+                    pre_k[offset : offset + length],
+                    ks,
+                    vs,
+                    qs,
+                    req.output_len,
+                )
+                kc, vc = ks.unsqueeze(0), vs.unsqueeze(0)
+            else:
+                if length != 1:
+                    raise ValueError("Original ShadowKV decode requires one token per request")
+                kc, vc = self.kvcache.decode(req.table_idx, layer_id, qs, ks, vs, req.device_len)
+            outputs.append(
+                flash3_kvcache_impl(
+                    qs.unsqueeze(0),
+                    kc,
+                    vc,
+                    softmax_scale=self.scale,
+                    causal=True,
+                ).squeeze(0)
+            )
+            offset += length
+        return torch.cat(outputs, dim=0)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -157,7 +210,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
         batch_indices = [req.table_idx for req in reqs]
-        if self.shadowkv_enabled:
+        if self.shadowkv_enabled == "YAKV":
             if batch.is_prefill:
                 self.kvcache.prepare_shadowkv_metadata(seqlens_k, batch_indices)
             else:

@@ -51,6 +51,8 @@ class AttentionLayer(StateLessOP):
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+        if ctx.shadowkv_enabled == "OGShadowKV" and ctx.batch.is_prefill:
+            ctx.kv_cache.capture_pre_rope(k, self.rotary._cos_sin_cache)
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)

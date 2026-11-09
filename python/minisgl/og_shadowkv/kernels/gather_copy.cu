@@ -61,7 +61,7 @@ void gather_copy(
         // this only needs to run once
         cudaFuncSetAttribute(gahter_copy_fixed_start_end<PTYPE, int64_t, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gahter_copy_fixed_start_end<PTYPE, int64_t, 256><<<numBlocks, blockSize, maxSMBytes>>>(
+        gahter_copy_fixed_start_end<PTYPE, int64_t, 256><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         values_ptr,
         v_cache_buffer_ptr,
         cpu_v_length, 
@@ -73,7 +73,7 @@ void gather_copy(
         // this only needs to run once
         cudaFuncSetAttribute(gahter_copy_fixed_start_end<PTYPE, int64_t, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gahter_copy_fixed_start_end<PTYPE, int64_t, 128><<<numBlocks, blockSize, maxSMBytes>>>(
+        gahter_copy_fixed_start_end<PTYPE, int64_t, 128><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         values_ptr,
         v_cache_buffer_ptr,
         cpu_v_length, 
@@ -85,7 +85,7 @@ void gather_copy(
         // this only needs to run once
         cudaFuncSetAttribute(gahter_copy_fixed_start_end<PTYPE, int64_t, 512>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gahter_copy_fixed_start_end<PTYPE, int64_t, 512><<<numBlocks, blockSize, maxSMBytes>>>(
+        gahter_copy_fixed_start_end<PTYPE, int64_t, 512><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         values_ptr,
         v_cache_buffer_ptr,
         cpu_v_length, 
@@ -97,7 +97,7 @@ void gather_copy(
         // this only needs to run once
         cudaFuncSetAttribute(gahter_copy_fixed_start_end<PTYPE, int64_t, 1024>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gahter_copy_fixed_start_end<PTYPE, int64_t, 1024><<<numBlocks, blockSize, maxSMBytes>>>(
+        gahter_copy_fixed_start_end<PTYPE, int64_t, 1024><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         values_ptr,
         v_cache_buffer_ptr,
         cpu_v_length, 
@@ -133,7 +133,7 @@ void gather_copy_d2d_with_offsets(
         // this only needs to run once
         cudaFuncSetAttribute(gather_copy_d2d<PTYPE, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gather_copy_d2d<PTYPE, 256><<<numBlocks, blockSize, maxSMBytes>>>(
+        gather_copy_d2d<PTYPE, 256><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         keys_ptr, 
         nullptr,
         gpu_v_length, 
@@ -146,7 +146,7 @@ void gather_copy_d2d_with_offsets(
         // this only needs to run once
         cudaFuncSetAttribute(gather_copy_d2d<PTYPE, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gather_copy_d2d<PTYPE, 128><<<numBlocks, blockSize, maxSMBytes>>>(
+        gather_copy_d2d<PTYPE, 128><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         keys_ptr, 
         nullptr,
         gpu_v_length, 
@@ -159,7 +159,7 @@ void gather_copy_d2d_with_offsets(
         // this only needs to run once
         cudaFuncSetAttribute(gather_copy_d2d<PTYPE, 512>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gather_copy_d2d<PTYPE, 512><<<numBlocks, blockSize, maxSMBytes>>>(
+        gather_copy_d2d<PTYPE, 512><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         keys_ptr, 
         nullptr,
         gpu_v_length, 
@@ -172,7 +172,7 @@ void gather_copy_d2d_with_offsets(
         // this only needs to run once
         cudaFuncSetAttribute(gather_copy_d2d<PTYPE, 1024>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSMBytes);
 
-        gather_copy_d2d<PTYPE, 1024><<<numBlocks, blockSize, maxSMBytes>>>(
+        gather_copy_d2d<PTYPE, 1024><<<numBlocks, blockSize, maxSMBytes, at::cuda::getCurrentCUDAStream()>>>(
         keys_ptr, 
         nullptr,
         gpu_v_length, 
@@ -204,28 +204,28 @@ void reorder_keys_and_compute_offsets(
 
 
     if(map_size == 256) {
-        reorder_keys_and_mixed_offsets<int64_t, 256, 1024><<<numBlocks, blockSize>>>(
+        reorder_keys_and_mixed_offsets<int64_t, 256, 1024><<<numBlocks, blockSize, 0, at::cuda::getCurrentCUDAStream()>>>(
         cached_pos /*in*/, 
         cur_pos, 
         cached_pos /*out*/, 
         offsets_ptr, 
         cnts_ptr);
     } else if (map_size == 128) {
-        reorder_keys_and_mixed_offsets<int64_t, 128, 1024><<<numBlocks, blockSize>>>(
+        reorder_keys_and_mixed_offsets<int64_t, 128, 1024><<<numBlocks, blockSize, 0, at::cuda::getCurrentCUDAStream()>>>(
         cached_pos /*in*/, 
         cur_pos, 
         cached_pos /*out*/, 
         offsets_ptr, 
         cnts_ptr);
     } else if (map_size == 512) {
-        reorder_keys_and_mixed_offsets<int64_t, 512, 2048><<<numBlocks, blockSize>>>(
+        reorder_keys_and_mixed_offsets<int64_t, 512, 2048><<<numBlocks, blockSize, 0, at::cuda::getCurrentCUDAStream()>>>(
         cached_pos /*in*/, 
         cur_pos, 
         cached_pos /*out*/, 
         offsets_ptr, 
         cnts_ptr);
     } else if (map_size == 1024) {
-        reorder_keys_and_mixed_offsets<int64_t, 1024, 4096><<<numBlocks, blockSize>>>(
+        reorder_keys_and_mixed_offsets<int64_t, 1024, 4096><<<numBlocks, blockSize, 0, at::cuda::getCurrentCUDAStream()>>>(
         cached_pos /*in*/, 
         cur_pos, 
         cached_pos /*out*/, 

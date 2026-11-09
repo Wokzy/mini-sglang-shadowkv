@@ -37,6 +37,7 @@ class EngineConfig:
 
     additional_config_path: str | None = None
     shadowkv_config: ShadowKVConfig | None = None
+    og_shadowkv_config: OGShadowKVConfig | None = None
 
     def __post_init__(self):
         if self.additional_config_path is not None:
@@ -47,8 +48,18 @@ class EngineConfig:
                 shadowkv_config_dict := additional_config_dict.get("shadowkv_config", None)
             ) is not None:
                 self.shadowkv_config = ShadowKVConfig.from_dict(shadowkv_config_dict)
-            elif (og_shadowkv_config_dict := additional_config_dict.get("og_shadowkv_config", None)) is not None:
+            if (
+                og_shadowkv_config_dict := additional_config_dict.get("og_shadowkv_config", None)
+            ) is not None:
                 self.og_shadowkv_config = OGShadowKVConfig.from_dict(og_shadowkv_config_dict)
+
+        if (
+            self.shadowkv_config
+            and self.shadowkv_config.enabled
+            and self.og_shadowkv_config
+            and self.og_shadowkv_config.enabled
+        ):
+            raise ValueError("Enable only one ShadowKV implementation")
 
     @cached_property
     def hf_config(self):

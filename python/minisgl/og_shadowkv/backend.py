@@ -17,399 +17,393 @@
 #
 ################################################################################
 
-import math
-import torch
+from __future__ import annotations
+
 from dataclasses import dataclass
 
-from minisgl.models.config import ModelConfig
-from minisgl.distributed import get_tp_info
-from minisgl.utils import div_even, init_logger
-
+import torch
 import torch.nn.functional as F
 
-from minisgl.og_shadowkv.tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
-from minisgl.og_shadowkv_kernels import shadowkv
+from minisgl.distributed import get_tp_info
+from minisgl.models.config import ModelConfig
 
-import gc
 
-logger = init_logger(__name__)
-
-@dataclass(frozen=False)
+@dataclass
 class OGShadowKVConfig:
     enabled: bool = False
     chunk_size: int = 8
-    sparse_budget: int = 2048
-    outliers_budget: int = None # nuber of outlier chunks
-    keys_rank: int = 160
+    sparse_budget: int = 2048  # Tokens, not chunks.
+    outliers_budget: int | None = None  # Chunks per KV head.
+    rank: int = 160
     enable_offloading: bool = False
 
     def __post_init__(self):
-        assert self.sparse_budget >= 0, "Sparse budget cannot be negative"
+        if self.chunk_size <= 0 or self.sparse_budget < 0 or self.rank <= 0:
+            raise ValueError("Invalid original ShadowKV chunk size, sparse budget, or rank")
+        if self.sparse_budget % self.chunk_size:
+            raise ValueError("Original ShadowKV sparse_budget must be divisible by chunk_size")
         if self.outliers_budget is None:
-            self.outliers_budget = int((self.sparse_budget // 1024) * 24)
-
-
-        if self.enabled:
-            logger.info(f"INITTED ORIGINAL ShadowKV with {self}")
+            self.outliers_budget = (self.sparse_budget // 1024) * 24
+        if self.outliers_budget < 0:
+            raise ValueError("Original ShadowKV outliers_budget must be nonnegative")
 
     @classmethod
     def from_dict(cls, config: dict):
+        config = dict(config)
+        if "keys_rank" in config:
+            if "rank" in config:
+                raise ValueError("Specify only one of rank and keys_rank")
+            config["rank"] = config.pop("keys_rank")
         return cls(**config)
 
 
-class ShadowKVCache_CPU:
-    """
-    Reference: https://github.com/ByteDance-Seed/ShadowKV/blob/main/models/kv_cache.py#L371
+@dataclass
+class _LayerCache:
+    # Every request owns its lengths, landmarks, SVD, and hit/miss state.
+    # Kernel inputs remain contiguous batch-of-one views, even when scheduler
+    # slots are noncontiguous or requests have different prompt lengths.
+    k: torch.Tensor
+    v: torch.Tensor
+    prompt_len: int
+    sparse_start: int
+    sparse_end: int
+    length: int
+    u: torch.Tensor | None = None
+    sv: torch.Tensor | None = None
+    values: torch.Tensor | None = None
+    landmarks: torch.Tensor | None = None
+    landmark_ids: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    fast: bool = False
+    workspace: tuple = ()
 
-    ShadowKV, can be used for Llama-3-8B, Llama-3.1-8B, GLM-4-9B, Yi-200K
+
+class ShadowKVCache_CPU:
+    """Original ShadowKV with independent state for each scheduler request slot.
+
+    The original fused scoring, cache-hit reuse, CPU value gathering and key
+    reconstruction kernels are retained for their supported shapes. Other
+    shapes use the same algorithm in PyTorch. Short prompts use exact KV.
+    Only full prompt prefills and one-token decoding are supported.
     """
-    def __init__(self, 
+
+    def __init__(
+        self,
         config: ModelConfig,
         shadowkv_config: OGShadowKVConfig,
-        batch_size :int = 1,
-        max_length :int = 32*1024, 
-        device :str = 'cuda:0',
-        dtype = torch.bfloat16,
-        ) -> None:
-
-        tp_info = get_tp_info()
-        assert tp_info.size == 1, "Reference ShadowKV only works with TP size 1"
-
+        batch_size=1,
+        max_length=32 * 1024,
+        device="cuda:0",
+        dtype=torch.bfloat16,
+    ):
+        if get_tp_info().size != 1:
+            raise ValueError("Original ShadowKV currently requires TP size 1")
         self.config = config
         self.shadowkv_config = shadowkv_config
         self.batch_size = batch_size
         self.max_length = max_length
-        self.device = device
+        self.device = torch.device(device)
         self.dtype = dtype
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-
-        self.sparse_budget = self.shadowkv_config.sparse_budget
-        self.chunk_size = self.shadowkv_config.chunk_size
-        self.rank = self.shadowkv_config.rank
-        self.local_chunk = 4
-        self.outlier_chunk = self.shadowkv_config.outliers_budget
-
-        self.v_cache_cpu = torch.zeros(
-            config.num_hidden_layers,
-            batch_size,
-            config.num_key_value_heads,
-            self.max_length // self.chunk_size,
-            self.config.hidden_size // self.config.num_attention_heads * self.chunk_size,
-            device='cpu',
-            dtype=self.dtype,
-            pin_memory=True
-        )
-
-        self.k_cache_buffer = torch.zeros(
-            config.num_hidden_layers,
-            batch_size,
-            config.num_key_value_heads,
-            self.sparse_budget + 128 + (self.outlier_chunk+self.local_chunk)*self.chunk_size,
-            self.config.hidden_size // self.config.num_attention_heads,
-            device=self.device,
-            dtype=self.dtype
-        )
-
-        self.v_cache_buffer = torch.zeros(
-            config.num_hidden_layers,
-            batch_size,
-            config.num_key_value_heads,
-            self.sparse_budget + 128 + (self.outlier_chunk+self.local_chunk)*self.chunk_size,
-            self.config.hidden_size // self.config.num_attention_heads,
-            device=self.device,
-            dtype=self.dtype
-        )
-
-        self.num_layers = config.num_hidden_layers
-        self.kv_offset = 0
-        self.prefill = 0
-        self.gen_offset = 0
-
-        self.k_landmark = None
-        self.k_landmark_idx = None
-        self.U = None
-        self.SV = None
-
+        self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_kv_heads
+        self.num_attention_heads = config.num_qo_heads
+        self.num_key_value_groups = config.num_qo_heads // config.num_kv_heads
+        self.num_layers = config.num_layers
+        self.chunk_size = shadowkv_config.chunk_size
+        self.sparse_budget = shadowkv_config.sparse_budget
         self.select_sets = self.sparse_budget // self.chunk_size
-        assert self.select_sets * self.chunk_size == self.sparse_budget, f"({self.select_sets}) * {self.chunk_size} != {self.sparse_budget}"
+        self.rank = shadowkv_config.rank
+        self.outlier_chunk = shadowkv_config.outliers_budget
+        self.local_chunk = 4
+        self.slots: dict[int, dict[int, _LayerCache]] = {}
+        self._pre_rope: torch.Tensor | None = None
+        self._rope_cache: torch.Tensor | None = None
+        self.copy_stream = torch.cuda.Stream(device=self.device)
 
-        self.temp = torch.zeros(
-            self.batch_size, 
-            self.num_key_value_heads, 
-            self.select_sets, 
-            self.chunk_size*self.head_dim, 
-            device='cpu', 
-            dtype=self.dtype
-        ).contiguous()
+    def capture_pre_rope(self, k: torch.Tensor, cos_sin_cache: torch.Tensor):
+        # RoPE mutates q/k in place. Capture normalized keys before that happens.
+        self._pre_rope = k.reshape(-1, self.num_key_value_heads, self.head_dim).clone()
+        if self._rope_cache is None:
+            self._rope_cache = cos_sin_cache.to(device=self.device, dtype=self.dtype)
 
-        # batch prefill record
-        self.prefilled_batch = 0
+    def take_pre_rope(self):
+        k, self._pre_rope = self._pre_rope, None
+        if k is None:
+            raise RuntimeError("Original ShadowKV did not receive pre-RoPE keys")
+        return k
 
-        # v offload kernels
-        self.block_num = int(self.batch_size * self.num_key_value_heads)
-        self.offsets = torch.zeros(self.block_num*(self.sparse_budget // self.chunk_size), device=self.device, dtype=torch.int32).contiguous()
-        self.cnts = torch.zeros(self.block_num, device=self.device, dtype=torch.int32).contiguous()
-        self.signals = torch.zeros(self.block_num, device=self.device, dtype=torch.int32).contiguous()
-        self.position_ids = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, self.select_sets, device=self.device, dtype=torch.int64).fill_(-1).contiguous()
+    def reset_slot(self, slot: int):
+        if not 0 <= slot < self.batch_size:
+            raise ValueError(f"Invalid ShadowKV request slot {slot}")
+        self.release_slot(slot)
+        self.slots[slot] = {}
 
-        # k compute kernels
-        self.output = torch.zeros(
-            self.batch_size, 
-            self.num_key_value_heads, 
-            self.sparse_budget, 
-            self.head_dim, 
-            device='cpu', 
-            dtype=self.dtype
-        ).contiguous()
+    def release_slot(self, slot: int):
+        if slot in self.slots:
+            # CPU pinned values may still be read by a custom kernel, outside
+            # PyTorch's allocator tracking. Retire those reads before releasing.
+            self.copy_stream.synchronize()
+            del self.slots[slot]
 
-        # multi-stream
-        self.copy_stream = torch.cuda.Stream()
+    def prefill(
+        self,
+        slot: int,
+        layer: int,
+        pre_k: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q: torch.Tensor,
+        output_len: int,
+    ):
+        """Initialize one layer for one request; tensors are [tokens, heads, dim]."""
+        if layer == 0:
+            self.reset_slot(slot)
+        n, h, d = k.shape
+        c = self.chunk_size
+        # The upstream kernels require chunk counts aligned to eight.
+        chunks = max(0, n // c - self.local_chunk)
+        chunks -= chunks % 8
+        sparse = self.select_sets > 0 and chunks > self.select_sets + self.outlier_chunk
+        if not sparse:
+            state = self._allocate(n, n, n, output_len)
+            state.k[0, :, :n].copy_(k.transpose(0, 1))
+            state.v[0, :, :n].copy_(v.transpose(0, 1))
+            self.slots[slot][layer] = state
+            return
 
-    def print_stats(self):
-        print(f"ShadowKV_CPU | sparse budget {self.sparse_budget} | chunk size {self.chunk_size} |rank {self.rank} | cached {self.kv_offset} | local_chunk {self.local_chunk} | outlier_chunk {self.outlier_chunk}")
+        local = n - chunks * c
+        start = local + self.outlier_chunk * c
+        end = start + self.sparse_budget
+        state = self._allocate(n, start, end, output_len)
+        keys = k.transpose(0, 1).contiguous().unsqueeze(0)
+        values = v.transpose(0, 1).contiguous().unsqueeze(0)
+        grouped = keys[:, :, : chunks * c].reshape(1, h, chunks, c, d)
+        means = grouped.mean(dim=-2)
+        scores = F.cosine_similarity(means.unsqueeze(-2), grouped, dim=-1).amin(-1)
+        outliers = scores.topk(self.outlier_chunk, largest=False).indices
+        all_ids = torch.arange(chunks, device=self.device).expand(1, h, -1)
+        keep = torch.ones_like(all_ids, dtype=torch.bool).scatter_(-1, outliers, False)
+        ids = all_ids[keep].reshape(1, h, chunks - self.outlier_chunk)
+        state.landmark_ids = ids
+        state.landmarks = means.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, d)).contiguous()
+        state.k[:, :, :local].copy_(keys[:, :, -local:])
+        state.v[:, :, :local].copy_(values[:, :, -local:])
+        outlier_tokens = self._token_ids(outliers)
+        state.k[:, :, local:start].copy_(self._gather(keys, outlier_tokens))
+        state.v[:, :, local:start].copy_(self._gather(values, outlier_tokens))
 
-    ##### Encoding #####
-    def get_svd(self, new_k_cache, layer_idx):
-        # [bsz, 8, prefill, 128] OR [bsz, prefill, 1024]
-        if new_k_cache.shape[1] <= 32:
-            # [bsz, 8, prefill, 128] --> [bsz, prefill, 1024]
-            k_cache = new_k_cache.transpose(1, 2).reshape(self.batch_size, -1, self.num_key_value_heads*self.head_dim)
-        else:
-            # [bsz, prefill, 1024]
-            k_cache = new_k_cache
-        
-        if layer_idx == 0 and self.prefilled_batch == 0:
-            # init U, SV
-            self.U = torch.zeros(self.num_layers, self.batch_size, k_cache.shape[1], self.rank, device='cpu', dtype=self.dtype)
-            self.SV = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, self.head_dim, self.rank, device='cpu', dtype=self.dtype)
-        
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        
-        u, s, v = torch.svd(k_cache.float())
-        v = v.transpose(1,2)
-        
-        bsz = k_cache.shape[0]
-        # [bsz, 128k, 1024] --> [bsz, 128k, 160] [bsz, 160, 1024] (bsz, 8, 160, 128)
-        self.U[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].copy_(u[:, :, :self.rank].to(self.dtype)) # [bsz, 128k, 160]
-        
-        temp_sv = torch.matmul(torch.diag_embed(s[:, :self.rank]), v[:, :self.rank]).to(self.dtype).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2) # [bsz, 8, 160, 128]
-
-        # used for kernel
-        temp_sv = temp_sv.transpose(-1, -2) # [bsz, 8, 128, 160]
-        
-        self.SV[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].copy_(temp_sv) # [bsz, 8, 128, 160]
-
-        del u, s, v
-
-    def register_k_landmark(self, k_landmark, k_landmark_idx, layer_idx):
-        num_landmarks = k_landmark.shape[-2]
-        bsz = k_landmark.shape[0]
-        if layer_idx == 0 and self.prefilled_batch == 0:
-            # init k_landmark, k_landmark_idx
-            self.k_landmark = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, num_landmarks, self.head_dim, device='cpu', dtype=self.dtype)
-            self.k_landmark_idx = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, num_landmarks, device='cpu', dtype=torch.long)
-
-            # for fused gemm kernel
-            self.gemm_o = torch.zeros(self.batch_size, self.num_key_value_heads, self.num_key_value_groups, num_landmarks, device='cpu', dtype=torch.bfloat16).contiguous()
-            self.softmax_o = torch.zeros(self.batch_size, self.num_key_value_heads, self.num_key_value_groups, num_landmarks, device='cpu', dtype=torch.bfloat16).contiguous()
-            self.norm = torch.zeros(self.batch_size*self.num_key_value_heads, self.num_key_value_groups, (num_landmarks + 256 - 1) // 256, device='cpu', dtype=torch.float).contiguous()
-            self.sum = torch.zeros(self.batch_size*self.num_key_value_heads, self.num_key_value_groups, (num_landmarks + 256 - 1) // 256, device='cpu', dtype=torch.float).contiguous()
-        
-        self.k_landmark[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].copy_(k_landmark)
-        self.k_landmark_idx[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].copy_(k_landmark_idx)
-
-    def prefill_kv_cache(self,
-            new_v_cache :torch.Tensor,
-            layer_idx :int,
-            key_states_roped: torch.Tensor,
-            last_query_states=None
-            ):
-        
-        bsz, _, incoming, _ = new_v_cache.shape # [bsz, num_kv_heads, incoming, head_dim]
-        self.prefill = incoming
-        max_ctx_chunks = incoming // self.chunk_size
-        self.max_ctx_chunks_len = max_ctx_chunks * self.chunk_size
-        self.v_cache_cpu[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, :max_ctx_chunks].copy_(new_v_cache[:, :, :self.max_ctx_chunks_len].reshape(bsz, self.num_key_value_heads, max_ctx_chunks, self.chunk_size*self.head_dim), non_blocking=True) # [bsz, num_kv_heads, max_ctx_chunks, chunk_size*head_dim]
-
-        # [x0, x1, ...., self.chunks*chunk_size, local_chunk, rest]
-        self.chunks = incoming // self.chunk_size - self.local_chunk 
-        # ensure self.chunks is even
-        self.chunks = self.chunks - self.chunks % 8
-        
-        # store Post-RoPE k cache <prefill_local> to the cache
-        self.prefill_local = incoming - self.chunks * self.chunk_size # local chunks + align to chunk_size
-        self.k_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, :self.prefill_local].copy_(key_states_roped[:, :, -self.prefill_local:])
-        self.v_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, :self.prefill_local].copy_(new_v_cache[:, :, -self.prefill_local:])
-
-        key_states_roped_ctx = key_states_roped[:,:,:self.chunks*self.chunk_size].view(bsz, self.num_key_value_heads, self.chunks, self.chunk_size, self.head_dim)
-        landmark_candidates = key_states_roped_ctx.mean(dim=-2) # [bsz, kv_heads, chunks, head_dim]
-        
-        # compute the cos similarity between it and the original key cache
-        cos_sim = torch.nn.functional.cosine_similarity(landmark_candidates.unsqueeze(3).expand(-1, -1, -1, self.chunk_size, -1), key_states_roped_ctx, dim=-1) # [bsz, kv_heads, chunks, chunk_size]
-        
-        # get the outlier_chunk idx for each head # [bsz, kv_heads, outlier_chunk]
-        outlier_chunk_idx = cos_sim.min(dim=-1).values.topk(self.outlier_chunk, largest=False).indices
-    
-        # [bsz, kv_heads, chunks, chunk_size, head_dim] --gather[bsz, kv_heads, outlier_chunk]-->[bsz, kv_heads, outlier_chunk, chunk_size, head_dim]
-        outlier_chunk_k_cache = key_states_roped_ctx.gather(dim=2, index=outlier_chunk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, self.head_dim)).view(bsz, self.num_key_value_heads, self.outlier_chunk*self.chunk_size, self.head_dim)
-        
-        outlier_chunk_v_cache = new_v_cache[:,:,:self.chunks*self.chunk_size].view(bsz, self.num_key_value_heads, self.chunks, self.chunk_size, self.head_dim).gather(dim=2, index=outlier_chunk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, self.head_dim)).view(bsz, self.num_key_value_heads, self.outlier_chunk*self.chunk_size, self.head_dim)
-
-        self.sparse_start = self.prefill_local + self.outlier_chunk*self.chunk_size
-        self.sparse_end = self.prefill_local + self.outlier_chunk*self.chunk_size + self.sparse_budget
-
-        self.kernel_offset = self.sparse_start * self.head_dim
-        self.kernel_stride = self.v_cache_buffer[layer_idx].shape[-2] * self.head_dim
-        
-        # store outlier_chunk to the cache
-        self.k_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.prefill_local:self.sparse_start].copy_(outlier_chunk_k_cache)
-        self.v_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.prefill_local:self.sparse_start].copy_(outlier_chunk_v_cache)
-
-        # filter landmark_candidates using outlier_chunk and register the rest to k_landmark
-        # [bsz, kv_heads, chunks, head_dim] --> [bsz, kv_heads, chunks - outlier_chunk, head_dim]
-        # get rest_idx: [bsz, kv_heads, chunks] --filter--> [bsz, kv_heads, chunks - outlier_chunk]
-        all_idx = torch.arange(self.chunks, device=key_states_roped.device).unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1) # [bsz, kv_heads, chunks]
-        mask = torch.ones_like(all_idx, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=outlier_chunk_idx, value=False)
-        rest_idx = all_idx.masked_select(mask).view(bsz, self.num_key_value_heads, -1)
-
-        # register rest_idxed landmarks to k_landmark
-        self.register_k_landmark(landmark_candidates.gather(dim=2, index=rest_idx.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)).view(bsz, self.num_key_value_heads, -1, self.head_dim), rest_idx, layer_idx)
-
-        # fill cache for the first time
-        chunk_attn = torch.einsum('bhgd,bhcd->bhgc', last_query_states.view(-1, self.num_key_value_heads, self.num_key_value_groups, self.head_dim), self.k_landmark[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].to(last_query_states.device)) / math.sqrt(128) # [bsz, 8, 4, chunks]
-        chunk_attn = F.softmax(chunk_attn, dim=-1, dtype=torch.float32).to(self.dtype)
-        chunk_attn, _ = torch.max(chunk_attn, dim=-2) # [bsz, 8, chunks]
-        merged_results = torch.topk(chunk_attn, k=self.select_sets, dim=-1).indices # [bsz, 8, select_sets(256)]
-        selected_chunks = self.k_landmark_idx[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].to(last_query_states.device).gather(dim=-1, index=merged_results) # [bsz, 8, select_sets]
-        self.position_ids[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].copy_(selected_chunks)
-        assert self.position_ids[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].max() < self.chunks, f"position_ids exceed the max_length {self.position_ids[layer_idx].max()}"
-        assert self.position_ids[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz].min() >= 0, f"position_ids exceed the min_length {self.position_ids[layer_idx].min()}"
-        position_ids = (selected_chunks.unsqueeze(-1) * self.chunk_size + torch.arange(self.chunk_size, device=chunk_attn.device).unsqueeze(0).unsqueeze(0).unsqueeze(0)).view(bsz, self.num_key_value_heads, -1)
-        value_ = new_v_cache.gather(dim=-2, index=position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim))
-        self.v_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.sparse_start:self.sparse_end].copy_(value_, non_blocking=True)
-        key_ = key_states_roped.gather(dim=-2, index=position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim))
-        self.k_cache_buffer[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.sparse_start:self.sparse_end].copy_(key_, non_blocking=True)
-
-        if layer_idx == self.num_layers - 1:
-            assert self.sparse_budget < incoming
-            # self.kv_offset += incoming
-            self.prefilled_batch += bsz
-
-            if self.prefilled_batch == self.batch_size:
-                self.kv_offset += incoming
-
-                assert torch.any(self.position_ids == -1) == False, f"The cache for offloading is not built correctly, {self.position_ids}"
-
-    ##### Decoding #####
-    def get_retrieval_position_ids(self, layer_idx, query_states):
-        # self.k_landmark[layer_idx][:, :, :self.chunks] is [bsz, 8, chunks, head_dim]
-        # chunk_attn: [bsz, 32, window_size, chunks]
-        self.incoming_q_len = query_states.shape[-2] # 1
-
-        # gemm_softmax
-        shadowkv.batch_gemm_softmax(
-            query_states.contiguous(),
-            self.k_landmark[layer_idx].contiguous(),
-            self.gemm_o,
-            self.norm,
-            self.sum,
-            self.softmax_o,
-            self.batch_size * self.num_key_value_heads,
-            self.num_key_value_groups * self.incoming_q_len,
-            self.k_landmark[layer_idx].shape[-2],
-            self.head_dim,
-            1 / math.sqrt(128),
-            0
+        # Decompose all heads together, as in the authors' implementation.
+        matrix = pre_k.reshape(n, h * d).float()
+        u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+        rank = min(self.rank, s.numel())
+        state.u = u[:, :rank].to(self.dtype).unsqueeze(0).contiguous()
+        state.sv = (
+            (s[:rank, None] * vh[:rank])
+            .to(self.dtype)
+            .reshape(rank, h, d)
+            .permute(1, 2, 0)
+            .unsqueeze(0)
+            .contiguous()
         )
-        if self.num_key_value_groups > 1:
-            chunk_attn, _ = torch.max(self.softmax_o.view(self.batch_size, self.num_key_value_heads, self.num_key_value_groups, -1), dim=-2) # [bsz, 8, chunks]
+        if self.shadowkv_config.enable_offloading:
+            state.values = torch.empty(
+                (1, h, chunks * c, d), device="cpu", dtype=self.dtype, pin_memory=True
+            )
+            # Blocking D2H ensures the CPU cache is ready for mapped reads.
+            state.values.copy_(values[:, :, : chunks * c])
+        else:
+            state.values = values[:, :, : chunks * c].contiguous()
 
-        # [bsz, 8, seq] --> [bsz, 8, select_sets(256)]
-        merged_results = torch.topk(chunk_attn.view(self.batch_size, self.num_key_value_heads, -1), k=self.select_sets, dim=-1).indices
-        # use merged_results to gather the position_ids: [bsz, 8, select_sets] --> [bsz, 8, select_sets]
-        selected_chunks = self.k_landmark_idx[layer_idx].gather(dim=-1, index=merged_results) # [bsz, 8, select_sets]
-        shadowkv.reorder_keys_and_compute_offsets(self.position_ids[layer_idx], selected_chunks, self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, self.select_sets)
+        # Initialize exact selected keys. Subsequent hits preserve these keys;
+        # misses use the low-rank reconstruction, matching the original cache.
+        state.positions = self._select(state, q[-1:]).contiguous()
+        token_ids = self._token_ids(state.positions)
+        state.k[:, :, start:end].copy_(self._gather(keys, token_ids))
+        state.v[:, :, start:end].copy_(self._gather(values, token_ids))
+        state.fast = (
+            self.dtype == torch.bfloat16
+            and d == 128
+            and h <= 16
+            and c == 8
+            and rank % 8 == 0
+            and self.select_sets in (128, 256, 512, 1024)
+            and ids.shape[-1] % 8 == 0
+        )
+        if state.fast:
+            self._init_workspace(state)
+        self.slots[slot][layer] = state
 
-        return self.position_ids[layer_idx]
+    def _allocate(self, prompt_len, start, end, output_len):
+        # Allow one extra in-flight token from overlap scheduling. Unlike the
+        # reference's fixed +128 buffer, this also supports long generations.
+        capacity = end + output_len + 1
+        shape = (1, self.num_key_value_heads, capacity, self.head_dim)
+        return _LayerCache(
+            torch.empty(shape, device=self.device, dtype=self.dtype),
+            torch.empty(shape, device=self.device, dtype=self.dtype),
+            prompt_len,
+            start,
+            end,
+            end,
+        )
 
-    def get_value_cache(self, layer_idx, position_ids):
+    def _init_workspace(self, state):
+        h, g, n = self.num_key_value_heads, self.num_key_value_groups, state.landmarks.shape[-2]
 
-        shadowkv.gather_copy_with_offsets(self.v_cache_cpu[layer_idx], self.v_cache_buffer[layer_idx], self.temp, self.offsets, self.cnts, self.signals, self.batch_size, self.num_key_value_heads, int(self.max_ctx_chunks_len*self.head_dim), int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
+        def empty(shape, dtype=self.dtype):
+            return torch.empty(shape, device=self.device, dtype=dtype)
 
-        gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
+        state.workspace = (
+            empty((1, h, g, n)),
+            empty((1, h, g, n)),
+            empty((h, g, (n + 255) // 256), torch.float32),
+            empty((h, g, (n + 255) // 256), torch.float32),
+            empty((h * self.select_sets,), torch.int32),
+            empty((h,), torch.int32),
+            torch.zeros(h, device=self.device, dtype=torch.int32),
+            empty((1, h, self.sparse_budget, self.head_dim)),
+            empty((1, h, self.sparse_budget, self.head_dim)),
+        )
 
-        return self.v_cache_buffer[layer_idx][:, :, :self.sparse_end + gen_offset]
+    def _token_ids(self, ids):
+        return (
+            ids.unsqueeze(-1) * self.chunk_size + torch.arange(self.chunk_size, device=ids.device)
+        ).flatten(-2)
 
-    def get_key_cache(self, layer_idx, position_ids, rope_func, cos_sin_cache):
+    def _gather(self, tensor, ids):
+        return tensor.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim))
 
-        # gather key cache and rope them
-        u = self.U[layer_idx] # [bsz, 128k, rank]
-        sv = self.SV[layer_idx] # [bsz, 8, 128, rank]
+    def _select(self, state, q):
+        q = q.reshape(1, self.num_key_value_heads, self.num_key_value_groups, self.head_dim)
+        if state.fast:
+            from minisgl import og_shadowkv_kernels as kernels
 
-        shadowkv.gather_copy_d2d_with_offsets(self.k_cache_buffer[layer_idx], self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
-        batch_gather_gemm_rotary_pos_emb_cuda(u, sv, cos_sin_cache, position_ids, self.output, self.chunk_size, self.k_cache_buffer[layer_idx], self.sparse_start, self.sparse_end, self.cnts)
+            gemm, softmax, norm, sums, *_ = state.workspace
+            kernels.batch_gemm_softmax(
+                q.contiguous(),
+                state.landmarks,
+                gemm,
+                norm,
+                sums,
+                softmax,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                state.landmarks.shape[-2],
+                self.head_dim,
+                self.head_dim**-0.5,
+                0.0,
+            )
+            scores = softmax.amax(dim=2)
+        else:
+            logits = torch.matmul(q, state.landmarks.transpose(-1, -2)) * self.head_dim**-0.5
+            scores = logits.softmax(-1, dtype=torch.float32).to(self.dtype).amax(dim=2)
+        indices = scores.topk(self.select_sets, dim=-1).indices
+        return state.landmark_ids.gather(-1, indices)
 
-        gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
+    def decode(
+        self,
+        slot: int,
+        layer: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sequence_len: int,
+    ):
+        state = self.slots[slot][layer]
+        length = state.sparse_end + sequence_len - state.prompt_len
+        if length > state.k.shape[-2] or length != state.length + 1:
+            raise RuntimeError(f"Invalid ShadowKV decode length for slot {slot}: {length}")
+        state.k[0, :, length - 1].copy_(k.reshape(self.num_key_value_heads, self.head_dim))
+        state.v[0, :, length - 1].copy_(v.reshape(self.num_key_value_heads, self.head_dim))
+        if state.landmarks is not None:
+            selected = self._select(state, q)
+            if state.fast:
+                self._decode_fast(state, selected)
+            else:
+                self._decode_torch(state, selected)
+        state.length = length
+        # FlashAttention consumes [batch, tokens, heads, dim].
+        return state.k[:, :, :length].transpose(1, 2), state.v[:, :, :length].transpose(1, 2)
 
-        return self.k_cache_buffer[layer_idx][:, :, :self.sparse_end + gen_offset]
+    def _decode_fast(self, state, selected):
+        from minisgl import og_shadowkv_kernels as kernels
+        from .tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 
-    def H2D(self):
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        self.SV = self.SV.to(self.device)
-        self.U = self.U.to(self.device)
-        self.k_landmark = self.k_landmark.to(self.device)
-        self.k_landmark_idx = self.k_landmark_idx.to(self.device)
+        _, _, _, _, offsets, counts, signals, temp, output = state.workspace
+        h, d, budget = self.num_key_value_heads, self.head_dim, self.sparse_budget
+        kernels.reorder_keys_and_compute_offsets(
+            state.positions, selected.contiguous(), offsets, counts, 1, h, self.select_sets
+        )
+        current = torch.cuda.current_stream(self.device)
+        self.copy_stream.wait_stream(current)
+        with torch.cuda.stream(self.copy_stream):
+            kernels.gather_copy_with_offsets(
+                state.values,
+                state.v,
+                temp,
+                offsets,
+                counts,
+                signals,
+                1,
+                h,
+                state.values.shape[-2] * d,
+                budget * d,
+                state.sparse_start * d,
+                state.v.shape[-2] * d,
+                self.select_sets,
+            )
+        kernels.gather_copy_d2d_with_offsets(
+            state.k,
+            offsets,
+            counts,
+            1,
+            h,
+            budget * d,
+            state.sparse_start * d,
+            state.k.shape[-2] * d,
+            self.select_sets,
+        )
+        batch_gather_gemm_rotary_pos_emb_cuda(
+            state.u,
+            state.sv,
+            self._rope_cache,
+            state.positions,
+            output,
+            self.chunk_size,
+            state.k,
+            state.sparse_start,
+            state.sparse_end,
+            counts,
+        )
+        current.wait_stream(self.copy_stream)
 
-        self.gemm_o = self.gemm_o.to(self.device)
-        self.softmax_o = self.softmax_o.to(self.device)
-        self.norm = self.norm.to(self.device)
-        self.sum = self.sum.to(self.device)
-
-        self.temp = self.temp.to(self.device)
-        self.output = self.output.to(self.device)
-
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    def update_kv_cache(self, 
-            new_k_cache :torch.Tensor,
-            new_v_cache :torch.Tensor,
-            layer_idx :int,
-            ):
-
-        incoming = new_k_cache.shape[-2]
-        self.v_cache_buffer[layer_idx][:, :, self.sparse_end+self.gen_offset:self.sparse_end+self.gen_offset+incoming].copy_(new_v_cache, non_blocking=True)
-        self.k_cache_buffer[layer_idx][:, :, self.sparse_end+self.gen_offset:self.sparse_end+self.gen_offset+incoming].copy_(new_k_cache, non_blocking=True)
-
-        if layer_idx == self.num_layers - 1:
-            self.kv_offset += incoming
-            self.gen_offset += incoming
+    def _decode_torch(self, state, selected):
+        # Retain cached (possibly exact-prefill) keys on hits, just like the
+        # fused path. This fallback handles arbitrary budgets and head shapes.
+        matches = selected.unsqueeze(-1) == state.positions.unsqueeze(-2)
+        hits = matches.any(-1)
+        old_ids = matches.to(torch.int32).argmax(-1)
+        old_tokens = self._token_ids(old_ids)
+        old_keys = self._gather(state.k[:, :, state.sparse_start : state.sparse_end], old_tokens)
+        ids = self._token_ids(selected)
+        u = state.u[:, None].expand(-1, self.num_key_value_heads, -1, -1)
+        u = u.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, u.shape[-1]))
+        keys = torch.matmul(u, state.sv.transpose(-1, -2))
+        cs = self._rope_cache[ids].float()
+        cos, sin = cs.chunk(2, -1)
+        x, y = keys.float().chunk(2, -1)
+        keys = torch.cat((x * cos - y * sin, y * cos + x * sin), -1).to(self.dtype)
+        keys = torch.where(
+            hits.repeat_interleave(self.chunk_size, -1).unsqueeze(-1), old_keys, keys
+        )
+        # Only selected values cross PCIe; never copy the entire host cache.
+        value_ids = ids.cpu() if state.values.device.type == "cpu" else ids
+        values = self._gather(state.values, value_ids).to(self.device)
+        state.k[:, :, state.sparse_start : state.sparse_end].copy_(keys)
+        state.v[:, :, state.sparse_start : state.sparse_end].copy_(values)
+        state.positions = selected
 
     def clear(self):
-        self.k_cache_buffer.zero_()
-        self.v_cache_buffer.zero_()
-        self.k_landmark = None
-        self.k_landmark_idx = None
-        self.U = None
-        self.SV = None
-
-        self.kv_offset = 0
-        self.prefill = 0
-        self.gen_offset = 0
-        self.prefill_local = 0
-
-        self.prefilled_batch = 0
-
-    def get_kv_len(self):
-        return self.kv_offset
+        self.copy_stream.synchronize()
+        self.slots.clear()
+        self._pre_rope = None
