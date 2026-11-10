@@ -4,8 +4,8 @@
 scores to keep a bounded GPU KV cache and recall evicted pages from CPU.
 This integration is separate from YAKV/ShadowKV. Its implementation and Triton
 kernels live in [`python/minisgl/kernel/arkvale/`](python/minisgl/kernel/arkvale/).
-See [reference and implementation scope](python/minisgl/kernel/arkvale/REFERENCE.md)
-for the pinned upstream reference and differences.
+See [ArkVale method and implementation notes](docs/arkvale.md) for the pinned
+upstream reference and integration details.
 
 ## Install and launch
 
@@ -90,47 +90,7 @@ on the GPU and backup/recall on a transfer stream, without a CPU miss-list
 round-trip. Selection is shared across KV heads; equal scores prefer the lower
 logical page (the reference's `torch.topk` tie order is unspecified). It does not
 implement cross-layer predictive prefetch, quantization, or per-layer budgets.
-See [GPU bookkeeping and transfer results](docs/arkvale-gpu-bookkeeping.md) for
-stream dependencies, correctness checks and paired speed-up measurements.
-
-## Matched ShadowKV comparison
-
-Use the same launcher and environment for both modes (run separately):
-
-```bash
-PYTHON=.venv/bin/python bash launch_comparison.sh arkvale
-PYTHON=.venv/bin/python bash launch_comparison.sh shadowkv
-```
-
-`MODEL`, `MAX_SEQ_LEN`, `MAX_RUNNING_REQUESTS`, `NUM_PAGES`, `MEMORY_RATIO`,
-`HOST`, and `PORT` override common settings. Both modes default to BF16, overlap
-scheduling, graphs off, naive cache, single-request full prefill, and identical
-logical token capacity. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for both modes
-for a non-overlap ablation. `ARKVALE_CONFIG` and `SHADOWKV_CONFIG` select their
-algorithm-specific JSON files; the defaults are **not** accuracy- or traffic-matched.
-See [serving comparison notes](docs/arkvale-serving-comparison.md) for remaining
-differences and validation results.
-
-## Validate and stop
-
-```bash
-# The unchanged legacy test_overlap_rejected asserts the old restriction.
-python -m pytest -q tests/kernel/test_arkvale.py tests/arkvale -k 'not test_overlap_rejected'
-# In another terminal after the server is ready:
-python tests/arkvale/smoke_server.py --base-url http://127.0.0.1:1919
-```
-
-The smoke client checks five sequential/concurrent requests, nonempty responses,
-streaming cancellation, and slot reuse. Long requests deliberately ignore EOS to
-exercise page-boundary transitions; short requests use normal EOS termination. With the example small page budget, its long prompts exercise
-scoring and recall. Check server `ArkVale request ... released` logs for nonzero
-`score_steps` and `evictions`, and confirm there are no CUDA errors or tracebacks.
-`recalls` counts CPU-to-GPU page loads, including initial fills. The server must
-finish requests normally, not merely return a healthy readiness endpoint.
-
-Stop the foreground server with **Ctrl-C** after validation and wait for workers
-to exit. If launching in a background process group, retain its process-group ID
-and terminate only that group; never kill unrelated inference processes.
+See [the method and implementation notes](docs/arkvale.md) for high-level details.
 
 # YAKV
 
@@ -345,7 +305,7 @@ You can also use `/reset` to clear the chat history.
 
 ### Offline inference
 
-See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
+Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for an ablation study on overlap scheduling.
 
 Test Configuration:
 
