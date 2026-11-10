@@ -26,6 +26,8 @@ class GPUDecode:
         self.misses = torch.empty((s, c), device=device, dtype=torch.int32)
         self.order = torch.empty_like(self.misses)
         self.lengths = torch.empty((s,), device=device, dtype=torch.int32)
+        self.budgets = torch.empty((s,), device=device, dtype=torch.int32)
+        self.topks = torch.empty((s,), device=device, dtype=torch.int32)
         self.transfer_stream = torch.cuda.Stream(device=device)
         self.last_use = torch.cuda.Event()
         self.last_use.record(torch.cuda.current_stream(device))
@@ -33,6 +35,8 @@ class GPUDecode:
     def initialize(self, uid, layer, state):
         """Publish reference prefill/scalar state once, not on batched decode."""
         slot = self.pool.uid_slots[uid]
+        self.budgets[slot] = state.capacity
+        self.topks[slot] = state.topk
         mapping = [-1] * self.pool.capacity
         ages = [0] * self.pool.capacity
         for age, (page, physical) in enumerate(state.mapping.items()):
@@ -56,6 +60,8 @@ class GPUDecode:
         pool = self.pool
         cfg = pool.config
         slot = pool.uid_slots[uid]
+        self.budgets[slot] = state.capacity
+        self.topks[slot] = state.topk
         n, h, d = keys.shape
         mp, cap, p = pool.max_pages, pool.capacity, cfg.page_size
         engine = torch.cuda.current_stream(pool.device)
@@ -72,6 +78,7 @@ class GPUDecode:
         query = query.unsqueeze(0).contiguous()
         common = {"LAYER": layer, "L": pool.num_layers}
         batched.score_pages[(mp, 1)](
+            self.budgets,
             query,
             pool.digest_buffer,
             active,
@@ -92,6 +99,8 @@ class GPUDecode:
             **common,
         )
         batched.select_pages[(1,)](
+            self.budgets,
+            self.topks,
             pool.score_buffer,
             active,
             lengths,
@@ -105,7 +114,6 @@ class GPUDecode:
             MP=mp,
             P=p,
             CAP=cap,
-            TOPK=cfg.page_topk,
             SINK=cfg.sink_pages,
             WINDOW=cfg.window_pages,
             BP=tr.next_power_of_2(mp),
@@ -174,6 +182,7 @@ class GPUDecode:
             )
 
         batched.score_pages[(mp, bs)](
+            self.budgets,
             q,
             pool.digest_buffer,
             active,
@@ -194,6 +203,8 @@ class GPUDecode:
             **common,
         )
         batched.select_pages[(bs,)](
+            self.budgets,
+            self.topks,
             pool.score_buffer,
             active,
             lengths,
@@ -207,7 +218,6 @@ class GPUDecode:
             MP=mp,
             P=p,
             CAP=cap,
-            TOPK=cfg.page_topk,
             SINK=cfg.sink_pages,
             WINDOW=cfg.window_pages,
             BP=tr.next_power_of_2(mp),

@@ -62,6 +62,16 @@ python -m minisgl \
 
 `page_size` and `page_budget` control ArkVale's internal page geometry and
 per-request/per-layer GPU residency. They are distinct from scheduler `--page-size`
-and logical `--num-pages` capacity. `page_topk` includes protected pages;
+and logical `--num-pages` capacity. `page_size` remains an integer token count.
+Both `page_budget` and `page_topk` accept integer page counts or floats
+in `(0, 1]` representing fractions of `ceil(prompt_len / page_size)`. Ratios
+round up to pages and resolve per request at prefill, for both GPU and reference
+decode, then remain fixed during generation. For example, a 32768-token prompt
+with page size 32, budget 0.25 and top-k 0.125 yields 256 resident pages and 128
+requested pages; a 16384-token prompt yields 128 and 64. Batched requests can
+have different budgets. Storage is still preallocated against the maximum sequence
+length as an upper bound. This enables prompt-relative budget comparisons,
+not exact memory or attention-work equivalence with ShadowKV (which also has
+sink/local allocations and compressed storage). `page_topk` includes protected pages;
 `max_cpu_bytes` bounds the preallocated host backing. Keep memory headroom for
 the model, activations and attention workspaces.

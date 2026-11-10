@@ -69,15 +69,24 @@ def tokenize_worker(
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
             assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
             if len(detokenize_msg) > 0:
-                replies = detokenize_manager.detokenize(detokenize_msg)
+                # Rejected requests have no detokenizer state and no output token.
+                rejected = [msg for msg in detokenize_msg if msg.error is not None]
+                accepted = [msg for msg in detokenize_msg if msg.error is None]
+                replies = detokenize_manager.detokenize(accepted) if accepted else []
                 batch_output = BatchFrontendMsg(
                     data=[
+                        UserReply(
+                            uid=msg.uid, incremental_output="", finished=True, error=msg.error
+                        )
+                        for msg in rejected
+                    ]
+                    + [
                         UserReply(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
                         )
-                        for msg, reply in zip(detokenize_msg, replies, strict=True)
+                        for msg, reply in zip(accepted, replies, strict=True)
                     ]
                 )
                 if len(batch_output.data) == 1:

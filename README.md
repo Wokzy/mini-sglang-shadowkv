@@ -63,12 +63,27 @@ python -m minisgl \
   the reference path for larger page tables.
 - `page_size`: internal ArkVale tokens per page, a power of two from 1 to 128.
   Independent of scheduler `--page-size`, which must remain 1.
-- `page_budget`: maximum GPU-resident pages **per request, per layer**.
-- `page_topk`: total pages requested per decode step, **including** protected
+- `page_budget`: maximum GPU-resident pages **per request, per layer**. Accepts
+  an integer page count or a floating-point ratio in `(0, 1]` of this request's
+  prompt pages (`ceil(prompt_len / page_size)`).
+- `page_topk`: accepts the same integer/ratio units as `page_budget`, with ratios
+  using the **same prompt-length denominator**, not `page_budget`. Specifies
+  total pages requested per decode step, **including** protected
   sink/window pages. Must satisfy
   `sink_pages + window_pages < page_topk <= page_budget`.
   Other resident pages are retained until space is needed; attention uses all
   resident pages, matching upstream's default non-sparse-attention mode.
+  For example, with a **32768-token prompt** and `page_size: 32`,
+  `"page_budget": 0.25, "page_topk": 0.125` resolves to 256 resident pages
+  and 128 requested pages; a 16384-token prompt resolves to 128 and 64 pages.
+  Ratios round up to whole pages at prefill, separately for each request, and
+  remain fixed during generation. The configured maximum sequence length only
+  determines the preallocated storage upper bound, not a request's active budget.
+  Use `1.0` for 100%, not `1` (one page). Mixed integer and ratio settings are
+  supported. Resolved values must satisfy the constraint above; tiny ratios
+  are rejected before scheduler admission rather than silently enlarged to fit
+  protected pages. Non-streaming chat requests receive HTTP 400; streaming
+  requests receive an error event followed by `[DONE]`.
 - `sink_pages` / `window_pages`: always retain the first / most recent pages.
   Sink may be zero; window must be at least two pages.
 - `max_cpu_bytes`: total pinned CPU backing-store budget. Each configured request

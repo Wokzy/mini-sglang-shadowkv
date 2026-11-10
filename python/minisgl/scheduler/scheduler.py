@@ -194,6 +194,20 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            from minisgl.kernel.arkvale.cache import ArkValePool
+
+            pool = self.engine.ctx.kv_cache
+            if isinstance(pool, ArkValePool):
+                try:
+                    pool.config.resolve(input_len)
+                except ValueError as exc:
+                    # Reject before allocating a request table/cache slot. Forward
+                    # errors escape the serving loop, so validate prompt ratios here.
+                    logger.warning_rank0(f"Rejecting request {msg.uid}: {exc}")
+                    self.send_result(
+                        [DetokenizeMsg(uid=msg.uid, next_token=0, finished=True, error=str(exc))]
+                    )
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

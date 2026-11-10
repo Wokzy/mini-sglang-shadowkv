@@ -39,6 +39,7 @@ def append_host(
 
 @tr.jit
 def score_pages(
+    BUDGETS,
     Q,
     DG,
     ACTIVE,
@@ -64,7 +65,8 @@ def score_pages(
     slot = tl.load(ACTIVE + b).to(tl.int64)
     pages = tl.cdiv(tl.load(LENGTHS + b), P)
     score = tl.full((), -float("inf"), tl.float32)
-    if pages > CAP and page < pages and page >= SINK and page < pages - WINDOW:
+    capacity = tl.load(BUDGETS + slot)
+    if pages > capacity and page < pages and page >= SINK and page < pages - WINDOW:
         h = tl.arange(0, BH)
         d = tl.arange(0, BD)
         mask = (h[:, None] < HQ) & (d[None, :] < D)
@@ -80,6 +82,8 @@ def score_pages(
 
 @tr.jit
 def select_pages(
+    BUDGETS,
+    TOPKS,
     SCORES,
     ACTIVE,
     LENGTHS,
@@ -95,7 +99,6 @@ def select_pages(
     MP: tl.constexpr,
     P: tl.constexpr,
     CAP: tl.constexpr,
-    TOPK: tl.constexpr,
     SINK: tl.constexpr,
     WINDOW: tl.constexpr,
     BP: tl.constexpr,
@@ -105,17 +108,19 @@ def select_pages(
     b = tl.program_id(0)
     slot = tl.load(ACTIVE + b).to(tl.int64)
     state = slot * L + LAYER
+    capacity = tl.load(BUDGETS + slot)
+    topk = tl.load(TOPKS + slot)
     n = tl.load(LENGTHS + b)
     pages = tl.cdiv(n, P)
     p = tl.arange(0, BP)
     c = tl.arange(0, BC)
     protected = (p < pages) & ((p < SINK) | (p >= pages - WINDOW))
     desired = protected
-    if pages <= CAP:
+    if pages <= capacity:
         desired = p < pages
     else:
         scores = tl.load(SCORES + b * MP + p, p < MP, other=-float("inf"))
-        requested = CAP if INITIAL else TOPK
+        requested = capacity if INITIAL else topk
         remaining = tl.minimum(
             requested - tl.sum(protected.to(tl.int32), 0), pages - tl.sum(protected.to(tl.int32), 0)
         )
@@ -142,11 +147,13 @@ def select_pages(
             page = tl.min(tl.where(todo, p, 2147483647), 0)
             hit = tl.sum(((c < CAP) & (mapping == page)).to(tl.int32), 0) > 0
             if not hit:
-                free = tl.min(tl.where((c < CAP) & (mapping < 0), c, 2147483647), 0)
+                free = tl.min(tl.where((c < capacity) & (mapping < 0), c, 2147483647), 0)
                 if free == 2147483647:
                     keep = tl.gather(needed, tl.maximum(mapping, 0), 0)
-                    oldest = tl.min(tl.where((c < CAP) & ~keep, age, 9223372036854775807), 0)
-                    free = tl.min(tl.where((c < CAP) & (age == oldest) & ~keep, c, 2147483647), 0)
+                    oldest = tl.min(tl.where((c < capacity) & ~keep, age, 9223372036854775807), 0)
+                    free = tl.min(
+                        tl.where((c < capacity) & (age == oldest) & ~keep, c, 2147483647), 0
+                    )
                     evicted += 1
                 mapping = tl.where(c == free, page, mapping)
                 age = tl.where(c == free, clock, age)
@@ -168,7 +175,7 @@ def select_pages(
     old = tl.load(COUNTS + state * 3 + 1)
     tl.store(COUNTS + state * 3 + 1, old + evicted)
     old = tl.load(COUNTS + state * 3 + 2)
-    tl.store(COUNTS + state * 3 + 2, old + (pages > CAP).to(tl.int32))
+    tl.store(COUNTS + state * 3 + 2, old + (pages > capacity).to(tl.int32))
 
 
 @tr.jit

@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -9,10 +10,11 @@ class ArkValeConfig:
     # Disable for the synchronous Python reference / matched ablations.
     gpu_decode: bool = True
     page_size: int = 32
-    page_budget: int = 128
+    # Integers are page counts; floats in (0, 1] are fractions of prompt pages.
+    page_budget: int | float = 128
     # Total pages requested each step, including sink and window pages.
     # Remaining resident pages are retained and also attended (upstream's default).
-    page_topk: int = 64
+    page_topk: int | float = 64
     sink_pages: int = 2
     window_pages: int = 2
     max_cpu_bytes: int = 8 * 1024**3
@@ -23,8 +25,6 @@ class ArkValeConfig:
                 raise ValueError(f"arkvale.{name} must be a boolean")
         for name in (
             "page_size",
-            "page_budget",
-            "page_topk",
             "sink_pages",
             "window_pages",
             "max_cpu_bytes",
@@ -35,12 +35,46 @@ class ArkValeConfig:
             raise ValueError("arkvale.page_size must be a power of two in [1, 128]")
         if self.sink_pages < 0 or self.window_pages < 2:
             raise ValueError("ArkVale requires sink_pages >= 0 and window_pages >= 2")
-        if not self.sink_pages + self.window_pages < self.page_topk <= self.page_budget:
-            raise ValueError(
-                "ArkVale requires sink_pages + window_pages < page_topk <= page_budget"
-            )
+        for name in ("page_budget", "page_topk"):
+            value = getattr(self, name)
+            if type(value) is int:
+                if value <= 0:
+                    raise ValueError(f"arkvale.{name} must be positive")
+            elif type(value) is float:
+                if not math.isfinite(value) or not 0 < value <= 1:
+                    raise ValueError(f"arkvale.{name} ratio must be in (0, 1]")
+            else:
+                raise ValueError(f"arkvale.{name} must be an integer page count or float ratio")
+        # Mixed units must first be resolved against each request's prompt length.
+        if type(self.page_budget) is int and type(self.page_topk) is int:
+            if not self.sink_pages + self.window_pages < self.page_topk <= self.page_budget:
+                raise ValueError(
+                    "ArkVale requires sink_pages + window_pages < page_topk <= page_budget"
+                )
         if self.max_cpu_bytes <= 0:
             raise ValueError("arkvale.max_cpu_bytes must be positive")
+
+    def resolve(self, prompt_len: int) -> "ArkValeConfig":
+        """Resolve ratios against this request's prompt; keep fixed during decode.
+
+        Both ratios use ceil(prompt_len / page_size), not the resident budget.
+        Round up to whole pages and reject budgets too small for protected pages.
+        """
+        if type(prompt_len) is not int or prompt_len <= 0:
+            raise ValueError("ArkVale prompt_len must be a positive integer")
+        pages = (prompt_len + self.page_size - 1) // self.page_size
+        counts = {
+            name: math.ceil(value * pages) if type(value) is float else value
+            for name in ("page_budget", "page_topk")
+            for value in (getattr(self, name),)
+        }
+        try:
+            return replace(self, **counts)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid ArkVale budgets for {pages} prompt pages: "
+                f"page_budget={counts['page_budget']}, page_topk={counts['page_topk']}: {exc}"
+            ) from exc
 
     @classmethod
     def from_dict(cls, value):

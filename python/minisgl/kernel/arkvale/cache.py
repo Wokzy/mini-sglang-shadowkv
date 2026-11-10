@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -13,6 +14,8 @@ class LayerCache:
     digests: torch.Tensor
     # Scalar reference bookkeeping; GPU serving uses GPUDecode's tensors instead.
     length: int = 0
+    capacity: int = 0
+    topk: int = 0
     mapping: dict[int, int] = field(default_factory=dict)
     recalls: int = 0
     evictions: int = 0
@@ -49,7 +52,12 @@ class ArkValePool:
         self.num_layers = model_config.num_layers
         self.max_seq_len = max_seq_len
         self.max_pages = (max_seq_len + config.page_size - 1) // config.page_size
-        self.capacity = min(self.max_pages, config.page_budget)
+        # Allocation upper bound only; actual limits are resolved per prompt.
+        budget = config.page_budget
+        self.capacity = min(
+            self.max_pages,
+            math.ceil(budget * self.max_pages) if type(budget) is float else budget,
+        )
         if config.gpu_decode and self.max_pages > 32768:
             raise ValueError(
                 "ArkVale GPU bookkeeping supports at most 32768 logical pages per request; "
@@ -75,7 +83,7 @@ class ArkValePool:
         )
         if config.gpu_decode:
             required_gpu += max_requests * (
-                self.num_layers * (self.capacity * 12 + 8 + 24 + 8) + self.capacity * 8 + 4
+                self.num_layers * (self.capacity * 12 + 8 + 24 + 8) + self.capacity * 8 + 12
             )
         free, _ = torch.cuda.mem_get_info(device)
         if required_gpu > int(free * memory_ratio):
@@ -212,7 +220,7 @@ class ArkValePool:
             if page in state.mapping:
                 continue
             used = set(state.mapping.values())
-            free = next((slot for slot in range(self.capacity) if slot not in used), None)
+            free = next((slot for slot in range(state.capacity) if slot not in used), None)
             if free is None:
                 victim = next((old for old in state.mapping if old not in desired), None)
                 if victim is None:
@@ -225,7 +233,7 @@ class ArkValePool:
 
     def _select(self, state, query, initial=False, slot=0):
         pages = (state.length + self.config.page_size - 1) // self.config.page_size
-        if pages <= self.capacity:
+        if pages <= state.capacity:
             desired = set(range(pages))
         else:
             desired = self._protected(pages)
@@ -234,7 +242,7 @@ class ArkValePool:
             )
             protected = torch.tensor(sorted(desired), device=self.device, dtype=torch.long)
             scores.index_fill_(0, protected, -float("inf"))
-            requested = self.capacity if initial else self.config.page_topk
+            requested = state.capacity if initial else state.topk
             count = min(requested - len(desired), pages - len(desired))
             desired.update(torch.topk(scores, count).indices.tolist())
             state.score_steps += 1
@@ -244,7 +252,12 @@ class ArkValePool:
         n = keys.shape[0]
         if n > self.max_seq_len:
             raise ValueError("ArkVale sequence exceeds configured maximum")
+        resolved = self.config.resolve(n)
         state = self.create(uid, layer)
+        state.capacity = min(self.capacity, resolved.page_budget)
+        # Larger integer limits are nonbinding. Clamp before publishing int32
+        # GPU metadata, including for legacy configs with arbitrarily large ints.
+        state.topk = min(state.capacity, resolved.page_topk)
         self.request_lengths[uid] = n
         if gpu and self.gpu is not None:
             state.length = n
