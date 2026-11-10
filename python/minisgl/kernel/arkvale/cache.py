@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 
 import torch
@@ -53,11 +52,8 @@ class ArkValePool:
         self.max_seq_len = max_seq_len
         self.max_pages = (max_seq_len + config.page_size - 1) // config.page_size
         # Allocation upper bound only; actual limits are resolved per prompt.
-        budget = config.page_budget
-        self.capacity = min(
-            self.max_pages,
-            math.ceil(budget * self.max_pages) if type(budget) is float else budget,
-        )
+        # Include the protected-page fallback in the allocation upper bound.
+        self.capacity = min(self.max_pages, config.resolve(max_seq_len).page_budget)
         if config.gpu_decode and self.max_pages > 32768:
             raise ValueError(
                 "ArkVale GPU bookkeeping supports at most 32768 logical pages per request; "

@@ -66,7 +66,12 @@ and logical `--num-pages` capacity. `page_size` remains an integer token count.
 Both `page_budget` and `page_topk` accept integer page counts or floats
 in `(0, 1]` representing fractions of `ceil(prompt_len / page_size)`. Ratios
 round up to pages and resolve per request at prefill, for both GPU and reference
-decode, then remain fixed during generation. For example, a 32768-token prompt
+decode, then remain fixed during generation. If resolved budgets violate
+`sink_pages + window_pages < page_topk <= page_budget`, ArkVale logs a warning
+and raises `page_topk` to at least `sink_pages + window_pages + 1` and
+`page_budget` to at least the adjusted `page_topk`, rather than rejecting the
+request. This short-prompt fallback can exceed the configured ratios; integer
+budgets use the same fallback. For example, a 32768-token prompt
 with page size 32, budget 0.25 and top-k 0.125 yields 256 resident pages and 128
 requested pages; a 16384-token prompt yields 128 and 64. Batched requests can
 have different budgets. Storage is still preallocated against the maximum sequence

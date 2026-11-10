@@ -1,7 +1,10 @@
+import logging
 import math
 from dataclasses import dataclass, replace
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,9 +51,16 @@ class ArkValeConfig:
         # Mixed units must first be resolved against each request's prompt length.
         if type(self.page_budget) is int and type(self.page_topk) is int:
             if not self.sink_pages + self.window_pages < self.page_topk <= self.page_budget:
-                raise ValueError(
-                    "ArkVale requires sink_pages + window_pages < page_topk <= page_budget"
+                topk = max(self.page_topk, self.sink_pages + self.window_pages + 1)
+                budget = max(self.page_budget, topk)
+                logger.warning(
+                    "ArkVale budgets page_budget=%s, page_topk=%s do not satisfy "
+                    "sink_pages + window_pages < page_topk <= page_budget; "
+                    "falling back to page_budget=%s, page_topk=%s",
+                    self.page_budget, self.page_topk, budget, topk,
                 )
+                self.page_budget = budget
+                self.page_topk = topk
         if self.max_cpu_bytes <= 0:
             raise ValueError("arkvale.max_cpu_bytes must be positive")
 
@@ -58,7 +68,8 @@ class ArkValeConfig:
         """Resolve ratios against this request's prompt; keep fixed during decode.
 
         Both ratios use ceil(prompt_len / page_size), not the resident budget.
-        Round up to whole pages and reject budgets too small for protected pages.
+        Round up to whole pages and expand undersized budgets for protected pages.
+        The fallback keeps at least one selectable page beyond sink/window pages.
         """
         if type(prompt_len) is not int or prompt_len <= 0:
             raise ValueError("ArkVale prompt_len must be a positive integer")
@@ -68,13 +79,7 @@ class ArkValeConfig:
             for name in ("page_budget", "page_topk")
             for value in (getattr(self, name),)
         }
-        try:
-            return replace(self, **counts)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid ArkVale budgets for {pages} prompt pages: "
-                f"page_budget={counts['page_budget']}, page_topk={counts['page_topk']}: {exc}"
-            ) from exc
+        return replace(self, **counts)
 
     @classmethod
     def from_dict(cls, value):
