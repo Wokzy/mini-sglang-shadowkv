@@ -1,3 +1,112 @@
+# ArkVale
+
+[ArkVale](https://github.com/pku-liang/ArkVale) uses query-dependent key-page
+scores to keep a bounded GPU KV cache and recall evicted pages from CPU.
+This integration is separate from YAKV/ShadowKV. Its implementation and Triton
+kernels live in [`python/minisgl/kernel/arkvale/`](python/minisgl/kernel/arkvale/).
+See [ArkVale method and implementation notes](docs/arkvale.md) for the pinned
+upstream reference and integration details.
+
+## Install and launch
+
+Use the repository's normal CUDA/PyTorch installation below (`pip install -e .
+--no-build-isolation` in an existing environment). ArkVale's Triton kernels compile
+on first use; no separate upstream ArkVale extension or FlashInfer fork is needed.
+The accelerated path reuses this repository's `minisgl.shadowkv_kernels.map_to_gpu`
+helper to map pinned CPU storage. Build the existing ShadowKV extension as part
+of the normal installation, or set `gpu_decode=false` to use the synchronous
+reference path without that helper. Ensure
+`nvcc` is on `PATH` and `CUDA_HOME` points to your CUDA toolkit before launch;
+Mini-SGLang's existing JIT kernels need the toolkit even when ArkVale uses Triton.
+
+Supported runtime: FP16/BF16, tensor parallel size 1, scheduler page size
+1, naive cache, no CUDA graphs, and no chunked prefill. Overlap scheduling is
+supported, using the same shared-workspace stream ordering as ShadowKV.
+Set maximum prefill length at least as large as maximum sequence length.
+Unsupported combinations fail at startup. Model head dimensions up to 256 are
+supported by the ArkVale kernels (the model's own RoPE constraints still apply).
+
+```bash
+export MINISGL_DISABLE_OVERLAP_SCHEDULING=0
+python -m minisgl \
+    --model Qwen/Qwen3-0.6B \
+    --additional-config-path arkvale_config.json \
+    --attention-backend arkvale \
+    --cache-type naive --page-size 1 --graph 0 --tp-size 1 \
+    --max-running-requests 2 \
+    --max-seq-len-override 4096 --max-prefill-length 4096 \
+    --memory-ratio 0.5 \
+    --host 127.0.0.1 --port 1919
+```
+
+[`arkvale_config.json`](arkvale_config.json):
+
+```json
+{
+  "arkvale_config": {
+    "enabled": true,
+    "gpu_decode": true,
+    "page_size": 32,
+    "page_budget": 32,
+    "page_topk": 16,
+    "sink_pages": 2,
+    "window_pages": 2,
+    "max_cpu_bytes": 8589934592
+  }
+}
+```
+
+- `gpu_decode`: enable GPU-resident batched scoring, selection, FIFO bookkeeping,
+  and asynchronous backup/recall (default `true`, including GPU prefill setup).
+  Set to `false` for the previous synchronous reference integration. The GPU
+  path supports up to 32768 logical pages/request; increase `page_size` or use
+  the reference path for larger page tables.
+- `page_size`: internal ArkVale tokens per page, a power of two from 1 to 128.
+  Independent of scheduler `--page-size`, which must remain 1.
+- `page_budget`: maximum GPU-resident pages **per request, per layer**. Accepts
+  an integer page count or a floating-point ratio in `(0, 1]` of this request's
+  prompt pages (`ceil(prompt_len / page_size)`).
+- `page_topk`: accepts the same integer/ratio units as `page_budget`, with ratios
+  using the **same prompt-length denominator**, not `page_budget`. Specifies
+  total pages requested per decode step, **including** protected
+  sink/window pages. Must satisfy
+  `sink_pages + window_pages < page_topk <= page_budget`.
+  Other resident pages are retained until space is needed; attention uses all
+  resident pages, matching upstream's default non-sparse-attention mode.
+  For example, with a **32768-token prompt** and `page_size: 32`,
+  `"page_budget": 0.25, "page_topk": 0.125` resolves to 256 resident pages
+  and 128 requested pages; a 16384-token prompt resolves to 128 and 64 pages.
+  Ratios round up to whole pages at prefill, separately for each request, and
+  remain fixed during generation. The configured maximum sequence length only
+  determines the preallocated storage upper bound, not a request's active budget.
+  Use `1.0` for 100%, not `1` (one page). Mixed integer and ratio settings are
+  supported. Resolved values must satisfy the constraint above; tiny ratios
+  are rejected before scheduler admission rather than silently enlarged to fit
+  protected pages. Non-streaming chat requests receive HTTP 400; streaming
+  requests receive an error event followed by `[DONE]`.
+- `sink_pages` / `window_pages`: always retain the first / most recent pages.
+  Sink may be zero; window must be at least two pages.
+- `max_cpu_bytes`: total pinned CPU backing-store budget. Each configured request
+  slot reserves `2 * layers * ceil(max_seq_len / page_size) * page_size * KV_heads *
+  head_dim * dtype_bytes`. All slots are allocated at startup and reused on
+  completion/abort; buffers remain allocated until the pool is destroyed.
+  Startup checks require enough budget for all configured running requests.
+
+GPU storage is bounded by resident KV pages, per-page GPU digests, and a reusable
+batched gather workspace. Storage is indexed by scheduler request slot; decode
+uses one batched FlashAttention call per layer.
+`--memory-ratio` bounds this worst-case cache allocation against free memory
+following model loading; leave extra memory for prefill and model activations.
+`--num-pages`, if supplied, controls **logical scheduler token capacity**, not
+ArkVale GPU residency; normally leave it unset. Do not enable ShadowKV in the
+same JSON file. Prefill is exact; decode becomes approximate above `page_budget *
+page_size` tokens. The accelerated path performs batched selection/bookkeeping
+on the GPU and backup/recall on a transfer stream, without a CPU miss-list
+round-trip. Selection is shared across KV heads; equal scores prefer the lower
+logical page (the reference's `torch.topk` tie order is unspecified). It does not
+implement cross-layer predictive prefetch, quantization, or per-layer budgets.
+See [the method and implementation notes](docs/arkvale.md) for high-level details.
+
 # YAKV
 
 ## Prerequisites
@@ -211,7 +320,7 @@ You can also use `/reset` to clear the chat history.
 
 ### Offline inference
 
-See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
+Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for an ablation study on overlap scheduling.
 
 Test Configuration:
 

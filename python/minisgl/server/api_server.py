@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -140,17 +140,21 @@ class FrontendManager:
 
             pending = self.ack_map[uid]
             self.ack_map[uid] = []
-            ack = None
             for ack in pending:
+                if ack.finished:
+                    # Clean up before yielding: consumers can stop or raise on
+                    # the terminal reply without resuming this generator.
+                    self.ack_map.pop(uid, None)
+                    self.event_map.pop(uid, None)
                 yield ack
-            if ack and ack.finished:
-                break
-
-        del self.ack_map[uid]
-        del self.event_map[uid]
+                if ack.finished:
+                    return
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
+            if ack.error is not None:
+                yield f"data: {json.dumps({'error': {'message': ack.error, 'type': 'invalid_request_error'}})}\n\n".encode()
+                break
             yield f"data: {ack.incremental_output}\n".encode()
             if ack.finished:
                 break
@@ -161,6 +165,10 @@ class FrontendManager:
         first_chunk = True
         cnt = 1
         async for ack in self.wait_for_ack(uid):
+            if ack.error is not None:
+                yield f"data: {json.dumps({'error': {'message': ack.error, 'type': 'invalid_request_error'}})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
             delta = {}
             if first_chunk:
                 delta["role"] = "assistant"
@@ -289,6 +297,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
     async for ack in state.wait_for_ack(uid):
+        if ack.error is not None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": ack.error, "type": "invalid_request_error"}},
+            )
         full_content += ack.incremental_output
         if ack.finished:
             break

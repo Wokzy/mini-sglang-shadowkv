@@ -145,12 +145,20 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
+                # Overlap may have submitted a speculative step before EOS was
+                # observed, or an abort may have released this request already.
+                # Never emit that result or touch its potentially reused slot.
+                if req in self.finished_reqs:
+                    continue
                 if isinstance(req, ChunkedReq):
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
+                # device_len may already include the next speculative step in
+                # overlap mode. Terminate on committed host tokens, not on that
+                # ahead-of-time device cursor (which truncates output by one).
+                finished = len(req.input_ids) >= req.max_device_len
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
@@ -186,6 +194,20 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            from minisgl.kernel.arkvale.cache import ArkValePool
+
+            pool = self.engine.ctx.kv_cache
+            if isinstance(pool, ArkValePool):
+                try:
+                    pool.config.resolve(input_len)
+                except ValueError as exc:
+                    # Reject before allocating a request table/cache slot. Forward
+                    # errors escape the serving loop, so validate prompt ratios here.
+                    logger.warning_rank0(f"Rejecting request {msg.uid}: {exc}")
+                    self.send_result(
+                        [DetokenizeMsg(uid=msg.uid, next_token=0, finished=True, error=str(exc))]
+                    )
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -193,11 +215,17 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
+                self.finished_reqs.add(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        from minisgl.kernel.arkvale.cache import ArkValePool
+
+        if isinstance(self.engine.ctx.kv_cache, ArkValePool):
+            stats = self.engine.ctx.kv_cache.release(req.uid)
+            logger.info_rank0(f"ArkVale request {req.uid} released: {stats}")
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
@@ -209,14 +237,6 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
 
-        # Unlike the regular attention backends, ShadowKV keeps the active batch
-        # metadata in pool-owned tensors and reuses them for every batch.  With
-        # overlap scheduling, this method runs on the scheduler stream while the
-        # preceding forward is still consuming those tensors on the engine stream.
-        # Order the metadata rewrite after that forward without blocking the CPU.
-        if self.engine.ctx.shadowkv_enabled:
-            self.stream.wait_stream(self.engine.stream)
-
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -226,6 +246,14 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        # Offloading pools reuse slot-owned metadata/workspaces across batches.
+        # Wait BEFORE admission: prefill writes the token pool too, and a slot
+        # reused after abort must not race the preceding forward's token write.
+        # This orders GPU work without synchronizing the host.
+        if self.engine.ctx.shadowkv_enabled or getattr(
+            self.engine.ctx.kv_cache, "uses_shared_workspace", False
+        ):
+            self.stream.wait_stream(self.engine.stream)
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)

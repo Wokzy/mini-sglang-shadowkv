@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
 from minisgl.attention import ShadowKVConfig
+from minisgl.kernel.arkvale import ArkValeConfig
 
 
 @dataclass(frozen=False)
@@ -36,6 +37,7 @@ class EngineConfig:
 
     additional_config_path: str | None = None
     shadowkv_config: ShadowKVConfig | None = None
+    arkvale_config: ArkValeConfig | None = None
 
     def __post_init__(self):
         if self.additional_config_path is not None:
@@ -46,6 +48,15 @@ class EngineConfig:
                 shadowkv_config_dict := additional_config_dict.get("shadowkv_config", None)
             ) is not None:
                 self.shadowkv_config = ShadowKVConfig.from_dict(shadowkv_config_dict)
+            if (arkvale_dict := additional_config_dict.get("arkvale_config")) is not None:
+                self.arkvale_config = ArkValeConfig.from_dict(arkvale_dict)
+
+        if self.arkvale_config is not None and self.arkvale_config.enabled:
+            from minisgl.kernel.arkvale.config import validate_runtime
+
+            validate_runtime(self)
+        elif "arkvale" in self.attention_backend.split(","):
+            raise ValueError("--attention-backend arkvale requires enabled arkvale_config")
 
     @cached_property
     def hf_config(self):
