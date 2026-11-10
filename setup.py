@@ -3,6 +3,8 @@ import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 COMPUTE_CAP = os.environ.get("COMPUTE_CAP", "90")
 if int(COMPUTE_CAP) >= 90:
     COMPUTE_CAP += "a"
@@ -61,10 +63,10 @@ if not os.environ.get("DISABLE_SHADOWKV", False):
                 "python/minisgl/og_shadowkv/kernels/batch_gemm_softmax.cu",
             ],
             include_dirs=[
-                f"3rdparty/cutlass/include",
-                f"3rdparty/cutlass/examples/common",
-                f"3rdparty/cutlass/tools/util/include",
-                f"python/minisgl/og_shadowkv/kernels",
+                os.path.join(ROOT_DIR, "3rdparty/cutlass/include"),
+                os.path.join(ROOT_DIR, "3rdparty/cutlass/examples/common"),
+                os.path.join(ROOT_DIR, "3rdparty/cutlass/tools/util/include"),
+                os.path.join(ROOT_DIR, "python/minisgl/og_shadowkv/kernels"),
             ],
             extra_compile_args={
                 "cxx": ["-std=c++17"],

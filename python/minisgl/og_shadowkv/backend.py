@@ -36,6 +36,7 @@ class OGShadowKVConfig:
     outliers_budget: int | None = None  # Chunks per KV head.
     rank: int = 160
     enable_offloading: bool = False
+    max_out_len: int = 1024
 
     def __post_init__(self):
         if self.chunk_size <= 0 or self.sparse_budget < 0 or self.rank <= 0:
@@ -46,6 +47,8 @@ class OGShadowKVConfig:
             self.outliers_budget = (self.sparse_budget // 1024) * 24
         if self.outliers_budget < 0:
             raise ValueError("Original ShadowKV outliers_budget must be nonnegative")
+        if not isinstance(self.max_out_len, int) or self.max_out_len <= 0:
+            raise ValueError("Original ShadowKV max_out_len must be a positive integer")
 
     @classmethod
     def from_dict(cls, config: dict):
@@ -60,8 +63,7 @@ class OGShadowKVConfig:
 @dataclass
 class _LayerCache:
     # Every request owns its lengths, landmarks, SVD, and hit/miss state.
-    # Kernel inputs remain contiguous batch-of-one views, even when scheduler
-    # slots are noncontiguous or requests have different prompt lengths.
+    # K/V are views into the persistent layer/slot pools, not separate allocations.
     k: torch.Tensor
     v: torch.Tensor
     prompt_len: int
@@ -115,6 +117,26 @@ class ShadowKVCache_CPU:
         self.rank = shadowkv_config.rank
         self.outlier_chunk = shadowkv_config.outliers_budget
         self.local_chunk = 4
+        self.max_out_len = shadowkv_config.max_out_len
+        # Rounding the context chunk count down to a multiple of eight leaves
+        # up to seven extra full chunks and a partial chunk in the local suffix.
+        # This bound also accommodates every short prompt using the dense path.
+        prompt_capacity = (
+            self.sparse_budget + (self.outlier_chunk + self.local_chunk + 8) * self.chunk_size
+            if self.select_sets
+            else max_length  # A zero sparse budget retains the full context.
+        )
+        self.cache_capacity = min(max_length, prompt_capacity) + self.max_out_len + 1
+        # +1 allows the scheduler's extra in-flight decode after completion.
+        shape = (
+            self.num_layers,
+            batch_size,
+            self.num_key_value_heads,
+            self.cache_capacity,
+            self.head_dim,
+        )
+        self.k_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
+        self.v_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
         self.slots: dict[int, dict[int, _LayerCache]] = {}
         self._pre_rope: torch.Tensor | None = None
         self._rope_cache: torch.Tensor | None = None
@@ -156,6 +178,8 @@ class ShadowKVCache_CPU:
         output_len: int,
     ):
         """Initialize one layer for one request; tensors are [tokens, heads, dim]."""
+        if not 0 < output_len <= self.max_out_len:
+            raise ValueError(f"Original ShadowKV output_len must be in [1, {self.max_out_len}]")
         if layer == 0:
             self.reset_slot(slot)
         n, h, d = k.shape
@@ -165,7 +189,7 @@ class ShadowKVCache_CPU:
         chunks -= chunks % 8
         sparse = self.select_sets > 0 and chunks > self.select_sets + self.outlier_chunk
         if not sparse:
-            state = self._allocate(n, n, n, output_len)
+            state = self._make_layer_cache(slot, layer, n, n, n)
             state.k[0, :, :n].copy_(k.transpose(0, 1))
             state.v[0, :, :n].copy_(v.transpose(0, 1))
             self.slots[slot][layer] = state
@@ -174,7 +198,7 @@ class ShadowKVCache_CPU:
         local = n - chunks * c
         start = local + self.outlier_chunk * c
         end = start + self.sparse_budget
-        state = self._allocate(n, start, end, output_len)
+        state = self._make_layer_cache(slot, layer, n, start, end)
         keys = k.transpose(0, 1).contiguous().unsqueeze(0)
         values = v.transpose(0, 1).contiguous().unsqueeze(0)
         grouped = keys[:, :, : chunks * c].reshape(1, h, chunks, c, d)
@@ -233,19 +257,25 @@ class ShadowKVCache_CPU:
             self._init_workspace(state)
         self.slots[slot][layer] = state
 
-    def _allocate(self, prompt_len, start, end, output_len):
-        # Allow one extra in-flight token from overlap scheduling. Unlike the
-        # reference's fixed +128 buffer, this also supports long generations.
-        capacity = end + output_len + 1
-        shape = (1, self.num_key_value_heads, capacity, self.head_dim)
+    def _make_layer_cache(self, slot, layer, prompt_len, start, end):
+        if end + self.max_out_len + 1 > self.cache_capacity:
+            raise ValueError("Original ShadowKV prompt exceeds the configured cache capacity")
         return _LayerCache(
-            torch.empty(shape, device=self.device, dtype=self.dtype),
-            torch.empty(shape, device=self.device, dtype=self.dtype),
+            self.k_cache_buffer[layer, slot : slot + 1],
+            self.v_cache_buffer[layer, slot : slot + 1],
             prompt_len,
             start,
             end,
             end,
         )
+
+    def decode_lengths(self, sequence_lengths, slots):
+        # Lengths are layer-independent and returned in active query order,
+        # whereas the backing K/V storage remains in persistent slot order.
+        return [
+            self.slots[slot][0].sparse_end + length - self.slots[slot][0].prompt_len
+            for slot, length in zip(slots, sequence_lengths)
+        ]
 
     def _init_workspace(self, state):
         h, g, n = self.num_key_value_heads, self.num_key_value_groups, state.landmarks.shape[-2]
@@ -310,7 +340,10 @@ class ShadowKVCache_CPU:
         sequence_len: int,
     ):
         state = self.slots[slot][layer]
-        length = state.sparse_end + sequence_len - state.prompt_len
+        generated = sequence_len - state.prompt_len
+        length = state.sparse_end + generated
+        if generated > self.max_out_len + 1:
+            raise RuntimeError("Original ShadowKV decode exceeds max_out_len and overlap allowance")
         if length > state.k.shape[-2] or length != state.length + 1:
             raise RuntimeError(f"Invalid ShadowKV decode length for slot {slot}: {length}")
         state.k[0, :, length - 1].copy_(k.reshape(self.num_key_value_heads, self.head_dim))

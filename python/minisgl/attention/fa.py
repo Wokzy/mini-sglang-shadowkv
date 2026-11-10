@@ -107,45 +107,55 @@ class FlashAttentionBackend(BaseAttnBackend):
 
     def og_shadowkv_forward(self, q, k, v, layer_id, batch):
         h, d = self.config.num_kv_heads, self.config.head_dim
-        k, v = k.reshape(-1, h, d), v.reshape(-1, h, d)
-        pre_k = self.kvcache.take_pre_rope() if batch.is_prefill else None
-        outputs = []
-        offset = 0
-        for req in batch.reqs:
-            length = req.extend_len
-            qs, ks, vs = (
-                q[offset : offset + length],
-                k[offset : offset + length],
-                v[offset : offset + length],
-            )
-            if batch.is_prefill:
-                if req.cached_len:
-                    raise ValueError("Original ShadowKV requires a full prompt prefill")
-                self.kvcache.prefill(
+        k, v = k.view(-1, h, d), v.view(-1, h, d)
+        if batch.is_decode:
+            for i, req in enumerate(batch.reqs):
+                if req.extend_len != 1:
+                    raise ValueError("Original ShadowKV decode requires one token per request")
+                self.kvcache.decode(
                     req.table_idx,
                     layer_id,
-                    pre_k[offset : offset + length],
-                    ks,
-                    vs,
-                    qs,
-                    req.output_len,
+                    q[i : i + 1],
+                    k[i : i + 1],
+                    v[i : i + 1],
+                    req.device_len,
                 )
-                kc, vc = ks.unsqueeze(0), vs.unsqueeze(0)
-            else:
-                if length != 1:
-                    raise ValueError("Original ShadowKV decode requires one token per request")
-                kc, vc = self.kvcache.decode(req.table_idx, layer_id, qs, ks, vs, req.device_len)
-            outputs.append(
-                flash3_kvcache_impl(
-                    qs.unsqueeze(0),
-                    kc,
-                    vc,
-                    softmax_scale=self.scale,
-                    causal=True,
-                ).squeeze(0)
-            )
-            offset += length
-        return torch.cat(outputs, dim=0)
+            metadata: FAMetadata = batch.attn_metadata
+            # Transpose is a view. The gather kernels keep their head-major
+            # layout; FA accepts these strides without repacking the cache.
+            return flash3_kvcache_impl(
+                q.view(batch.size, 1, self.config.num_qo_heads, d),
+                self.kvcache.k_cache_buffer[layer_id].transpose(1, 2),
+                self.kvcache.v_cache_buffer[layer_id].transpose(1, 2),
+                cache_batch_idx=metadata.cache_batch_idx,
+                cache_seqlens=metadata.cache_seqlens,
+                softmax_scale=self.scale,
+                causal=True,
+            ).squeeze(1)
+
+        assert batch.size == 1, "1 prefill at a time only supported"
+
+        pre_k = self.kvcache.take_pre_rope()
+        req = batch.req[0]
+        if req.cached_len:
+            raise ValueError("Original ShadowKV requires a full prompt prefill")
+        self.kvcache.prefill(
+            req.table_idx,
+            layer_id,
+            pre_k,
+            k,
+            v,
+            q,
+            req.output_len,
+        )
+
+        return flash3_kvcache_impl(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=self.scale,
+            causal=True,
+        ).squeeze(0)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -184,6 +194,10 @@ class FlashAttentionBackend(BaseAttnBackend):
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
+
+        if self.shadowkv_enabled == "OGShadowKV" and batch.is_decode:
+            seqlens_k = self.kvcache.decode_lengths(seqlens_k, [req.table_idx for req in reqs])
+
         max_seqlen_k = max(seqlens_k)
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}

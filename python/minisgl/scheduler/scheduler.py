@@ -176,6 +176,8 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Received user msg: %s", msg)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
+            if self.engine.ctx.shadowkv_enabled == "OGShadowKV":
+                max_output_len = min(max_output_len, self.engine.ctx.kv_cache.max_out_len)
             if max_output_len <= 0:
                 return logger.warning_rank0(
                     f"Input sequence length {input_len} exceeds {max_seq_len}, "
