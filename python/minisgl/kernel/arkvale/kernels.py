@@ -74,6 +74,7 @@ def _gather(
     D: tl.constexpr,
     PAGE: tl.constexpr,
     CAP: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
     B: tl.constexpr,
 ):
     i = tl.program_id(0) * B + tl.arange(0, B)
@@ -83,7 +84,7 @@ def _gather(
     slot = tl.load(SLOTS + token // PAGE, token < N, other=0)
     offset = ((kind * CAP + slot) * PAGE + token % PAGE) * H * D + hd
     val = tl.load(KV + offset, i < N * H * D, other=0)
-    tl.store(OUT + kind * N * H * D + i, val, i < N * H * D)
+    tl.store(OUT + kind * OUT_STRIDE + i, val, i < N * H * D)
 
 
 def summarize_keys(keys, page_size, out=None, first_page=0):
@@ -100,12 +101,14 @@ def summarize_keys(keys, page_size, out=None, first_page=0):
     return out
 
 
-def estimate_scores(query, digests):
+def estimate_scores(query, digests, out=None):
     """One decode query [query_heads, dim], one shared page selection across heads."""
     assert query.is_cuda and query.is_contiguous() and digests.is_contiguous()
     pages, _, h, d = digests.shape
     assert query.shape[1] == d and query.shape[0] % h == 0
-    scores = torch.empty(pages, device=query.device, dtype=torch.float32)
+    scores = (
+        out if out is not None else torch.empty(pages, device=query.device, dtype=torch.float32)
+    )
     if pages:
         _score[(pages,)](
             query,
@@ -120,11 +123,13 @@ def estimate_scores(query, digests):
     return scores
 
 
-def gather_pages(kv, slots, token_count):
-    """Pack resident pages in logical order; omit padding in the last page."""
+def gather_pages(kv, slots, token_count, out=None):
+    """Pack pages, optionally into a slot view of a reusable batched workspace."""
     _, cap, page, h, d = kv.shape
-    out = torch.empty((2, token_count, h, d), device=kv.device, dtype=kv.dtype)
+    if out is None:
+        out = torch.empty((2, token_count, h, d), device=kv.device, dtype=kv.dtype)
+    assert out.shape == (2, token_count, h, d) and out[0].is_contiguous()
     _gather[(tr.cdiv(token_count * h * d, 512), 2)](
-        kv, slots, out, token_count, h, d, page, cap, 512
+        kv, slots, out, token_count, h, d, page, cap, out.stride(0), 512
     )
     return out

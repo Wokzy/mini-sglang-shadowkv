@@ -6,6 +6,8 @@ import torch
 @dataclass
 class ArkValeConfig:
     enabled: bool = True
+    # Disable for the synchronous Python reference / matched ablations.
+    gpu_decode: bool = True
     page_size: int = 32
     page_budget: int = 128
     # Total pages requested each step, including sink and window pages.
@@ -16,8 +18,9 @@ class ArkValeConfig:
     max_cpu_bytes: int = 8 * 1024**3
 
     def __post_init__(self):
-        if type(self.enabled) is not bool:
-            raise ValueError("arkvale.enabled must be a boolean")
+        for name in ("enabled", "gpu_decode"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"arkvale.{name} must be a boolean")
         for name in (
             "page_size",
             "page_budget",
@@ -46,8 +49,6 @@ class ArkValeConfig:
 
 def validate_runtime(config):
     """Reject combinations whose scheduling/cache semantics are not implemented."""
-    from minisgl.env import ENV
-
     if config.shadowkv_config is not None and config.shadowkv_config.enabled:
         raise ValueError("ArkVale and ShadowKV are mutually exclusive")
     if config.attention_backend not in ("auto", "arkvale", "arkvale,arkvale"):
@@ -63,8 +64,6 @@ def validate_runtime(config):
         raise ValueError("ArkVale requires float16 or bfloat16")
     if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
         raise ValueError("ArkVale requires --graph 0")
-    if not ENV.DISABLE_OVERLAP_SCHEDULING:
-        raise ValueError("ArkVale requires MINISGL_DISABLE_OVERLAP_SCHEDULING=1")
     if getattr(config, "cache_type", "naive") != "naive":
         raise ValueError("ArkVale requires --cache-type naive (no prefix reuse)")
     if getattr(config, "max_extend_tokens", config.max_seq_len) < config.max_seq_len:

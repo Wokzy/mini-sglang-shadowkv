@@ -1,6 +1,7 @@
 {
   "arkvale_config": {
     "enabled": true,
+    "gpu_decode": true,
     "page_size": 32,
     "page_budget": 32,
     "page_topk": 16,

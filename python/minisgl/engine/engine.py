@@ -70,7 +70,7 @@ class Engine:
                 max_requests=config.max_running_req,
                 memory_ratio=config.memory_ratio,
             )
-            logger.info_rank0("ArkVale enabled: bounded GPU pages with pinned CPU backing")
+            logger.info_rank0("ArkVale enabled: preallocated slot-based GPU pages and pinned CPU backing")
         elif config.shadowkv_config is not None and config.shadowkv_config.enabled:
             self.ctx.kv_cache = ShadowKVPool(
                 config=config.shadowkv_config,
@@ -176,7 +176,7 @@ class Engine:
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         if config.arkvale_config is not None and config.arkvale_config.enabled:
             # These scheduler slots account for logical tokens, not resident KV.
-            # GPU KV is lazily allocated by ArkVale, capped per request/layer.
+            # GPU KV is preallocated by ArkVale, capped per request/layer.
             return config.num_page_override or config.max_seq_len * config.max_running_req
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
