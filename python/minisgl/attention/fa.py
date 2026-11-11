@@ -136,7 +136,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert batch.size == 1, "1 prefill at a time only supported"
 
         pre_k = self.kvcache.take_pre_rope()
-        req = batch.req[0]
+        req = batch.reqs[0]
         if req.cached_len:
             raise ValueError("Original ShadowKV requires a full prompt prefill")
         self.kvcache.prefill(

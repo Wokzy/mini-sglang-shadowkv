@@ -26,6 +26,9 @@ import torch.nn.functional as F
 
 from minisgl.distributed import get_tp_info
 from minisgl.models.config import ModelConfig
+from minisgl.utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -34,6 +37,7 @@ class OGShadowKVConfig:
     chunk_size: int = 8
     sparse_budget: int = 2048  # Tokens, not chunks.
     outliers_budget: int | None = None  # Chunks per KV head.
+    local_chunks_count: int = 4  # Suffix chunks count
     rank: int = 160
     enable_offloading: bool = False
     max_out_len: int = 1024
@@ -62,8 +66,8 @@ class OGShadowKVConfig:
 
 @dataclass
 class _LayerCache:
-    # Every request owns its lengths, landmarks, SVD, and hit/miss state.
-    # K/V are views into the persistent layer/slot pools, not separate allocations.
+    # K/V, landmarks, landmark IDs, and values are shared-pool views.
+    # SVD factors and hit/miss state remain request-specific.
     k: torch.Tensor
     v: torch.Tensor
     prompt_len: int
@@ -84,8 +88,8 @@ class ShadowKVCache_CPU:
     """Original ShadowKV with independent state for each scheduler request slot.
 
     The original fused scoring, cache-hit reuse, CPU value gathering and key
-    reconstruction kernels are retained for their supported shapes. Other
-    shapes use the same algorithm in PyTorch. Short prompts use exact KV.
+    reconstruction kernels are retained for their supported shapes. Unsupported
+    sparse decode shapes raise RuntimeError. Short prompts use exact KV.
     Only full prompt prefills and one-token decoding are supported.
     """
 
@@ -116,7 +120,7 @@ class ShadowKVCache_CPU:
         self.select_sets = self.sparse_budget // self.chunk_size
         self.rank = shadowkv_config.rank
         self.outlier_chunk = shadowkv_config.outliers_budget
-        self.local_chunk = 4
+        self.local_chunk = shadowkv_config.local_chunks_count
         self.max_out_len = shadowkv_config.max_out_len
         # Rounding the context chunk count down to a multiple of eight leaves
         # up to seven extra full chunks and a partial chunk in the local suffix.
@@ -137,6 +141,35 @@ class ShadowKVCache_CPU:
         )
         self.k_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
         self.v_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
+
+        # Fixed-capacity backing storage, matching the reference's layer/batch/
+        # head layout. Active requests use compact prefix views of each slot:
+        # the fused kernels infer head strides from the actual request length.
+        self.max_chunks = max_length // self.chunk_size
+        shape = (self.num_layers, batch_size, self.num_key_value_heads, self.max_chunks)
+        self.k_landmark = torch.empty((*shape, self.head_dim), device=self.device, dtype=dtype)
+        self.k_landmark_idx = torch.empty(shape, device=self.device, dtype=torch.int64)
+
+        logger.info(
+            "Allocated original ShadowKV landmarks pool: %.2f GiB on %s",
+            self.k_landmark.numel() * self.k_landmark.element_size() / 2**30
+            + self.k_landmark_idx.numel() * self.k_landmark_idx.element_size() / 2**30,
+            self.k_landmark.device,
+        )
+
+        self.v_cache_cpu = torch.empty(
+            (*shape, self.chunk_size * self.head_dim),
+            device="cpu" if shadowkv_config.enable_offloading else self.device,
+            dtype=dtype,
+            pin_memory=shadowkv_config.enable_offloading,
+        )
+
+        logger.info(
+            "Allocated original ShadowKV value pool: %.2f GiB on %s",
+            self.v_cache_cpu.numel() * self.v_cache_cpu.element_size() / 2**30,
+            self.v_cache_cpu.device,
+        )
+
         self.slots: dict[int, dict[int, _LayerCache]] = {}
         self._pre_rope: torch.Tensor | None = None
         self._rope_cache: torch.Tensor | None = None
@@ -162,8 +195,7 @@ class ShadowKVCache_CPU:
 
     def release_slot(self, slot: int):
         if slot in self.slots:
-            # CPU pinned values may still be read by a custom kernel, outside
-            # PyTorch's allocator tracking. Retire those reads before releasing.
+            # Retire mapped reads before this slot's value storage can be reused.
             self.copy_stream.synchronize()
             del self.slots[slot]
 
@@ -180,6 +212,8 @@ class ShadowKVCache_CPU:
         """Initialize one layer for one request; tensors are [tokens, heads, dim]."""
         if not 0 < output_len <= self.max_out_len:
             raise ValueError(f"Original ShadowKV output_len must be in [1, {self.max_out_len}]")
+        if not 0 < k.shape[0] <= self.max_length:
+            raise ValueError("Original ShadowKV prompt exceeds max_length")
         if layer == 0:
             self.reset_slot(slot)
         n, h, d = k.shape
@@ -208,8 +242,17 @@ class ShadowKVCache_CPU:
         all_ids = torch.arange(chunks, device=self.device).expand(1, h, -1)
         keep = torch.ones_like(all_ids, dtype=torch.bool).scatter_(-1, outliers, False)
         ids = all_ids[keep].reshape(1, h, chunks - self.outlier_chunk)
-        state.landmark_ids = ids
-        state.landmarks = means.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, d)).contiguous()
+        num_landmarks = ids.shape[-1]
+        state.landmark_ids = (
+            self.k_landmark_idx[layer, slot].view(-1)[: h * num_landmarks].view(1, h, num_landmarks)
+        )
+        state.landmark_ids.copy_(ids)
+        state.landmarks = (
+            self.k_landmark[layer, slot]
+            .view(-1)[: h * num_landmarks * d]
+            .view(1, h, num_landmarks, d)
+        )
+        state.landmarks.copy_(means.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, d)))
         state.k[:, :, :local].copy_(keys[:, :, -local:])
         state.v[:, :, :local].copy_(values[:, :, -local:])
         outlier_tokens = self._token_ids(outliers)
@@ -229,14 +272,12 @@ class ShadowKVCache_CPU:
             .unsqueeze(0)
             .contiguous()
         )
-        if self.shadowkv_config.enable_offloading:
-            state.values = torch.empty(
-                (1, h, chunks * c, d), device="cpu", dtype=self.dtype, pin_memory=True
-            )
-            # Blocking D2H ensures the CPU cache is ready for mapped reads.
-            state.values.copy_(values[:, :, : chunks * c])
-        else:
-            state.values = values[:, :, : chunks * c].contiguous()
+        state.values = (
+            self.v_cache_cpu[layer, slot].view(-1)[: h * chunks * c * d].view(1, h, chunks * c, d)
+        )
+        # Blocking D2H ensures the CPU cache is ready for mapped reads. The
+        # pinned allocation is reused; only the valid prefix is written.
+        state.values.copy_(values[:, :, : chunks * c])
 
         # Initialize exact selected keys. Subsequent hits preserve these keys;
         # misses use the low-rank reconstruction, matching the original cache.
@@ -411,6 +452,9 @@ class ShadowKVCache_CPU:
         current.wait_stream(self.copy_stream)
 
     def _decode_torch(self, state, selected):
+        raise RuntimeError(
+            "You've tried to use unefficient implementation of Original ShadowKV. Make sure it is intented, then remove this `raise`"
+        )
         # Retain cached (possibly exact-prefill) keys on hits, just like the
         # fused path. This fallback handles arbitrary budgets and head shapes.
         matches = selected.unsqueeze(-1) == state.positions.unsqueeze(-2)
