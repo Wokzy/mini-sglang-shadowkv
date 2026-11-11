@@ -119,3 +119,12 @@ void batch_gemm_softmax(torch::Tensor A, torch::Tensor B,
                         torch::Tensor D, torch::Tensor Norm, torch::Tensor Sum,
                         torch::Tensor Softmax, int batch_count, int m, int n,
                         int k, float alpha, float beta);
+
+void batch_gemm_softmax_indexed(torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int, int, int);
+void reorder_keys_indexed(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int, int);
+void gather_copy_indexed(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int, int, int, int, bool);

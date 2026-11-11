@@ -477,7 +477,8 @@ __global__ void reorder_keys_and_mixed_offsets(
     T *query_keys,
     T *g_reorder_keys,
     int *g_offsets,
-    int *g_hit_cnt)
+    int *g_hit_cnt,
+    const int *slots = nullptr, const int *lengths = nullptr, int heads = 0)
 {
     __shared__ int s_values[LUT_SIZE];
     __shared__ int s_keys[LUT_SIZE];
@@ -486,9 +487,15 @@ __global__ void reorder_keys_and_mixed_offsets(
     __shared__ int reorder_keys[MAP_SIZE];
 
     int offset = blockIdx.x * MAP_SIZE + threadIdx.x;
+    int cache_offset = offset;
+    if (slots) {
+        int slot = slots[blockIdx.x / heads];
+        if (lengths[slot] == 0) return;
+        cache_offset = (slot * heads + blockIdx.x % heads) * MAP_SIZE + threadIdx.x;
+    }
 
     // create a shared memory map
-    int old_key = (T) (orig_keys[offset]);  // might be a cast
+    int old_key = (T) (orig_keys[cache_offset]);  // might be a cast
     init_map<MAP_SIZE, LUT_SIZE>(old_key, s_keys, s_values);
     __syncthreads();
 
@@ -507,7 +514,7 @@ __global__ void reorder_keys_and_mixed_offsets(
 
     // a hidden sync above
     // write out
-    g_reorder_keys[offset] = (T) (reorder_keys[threadIdx.x]); // might be a cast
+    g_reorder_keys[cache_offset] = (T) (reorder_keys[threadIdx.x]); // might be a cast
     g_offsets[offset] = offsets[threadIdx.x];
     if (threadIdx.x == 0)
     {

@@ -19,6 +19,7 @@
 
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <vector>
 
@@ -321,4 +322,69 @@ void gather_copy_with_offsets(
             cnts_ptr,
             signals_ptr);
     }
+}
+
+
+// Continuous batches: persistent data is slot-indexed; workspaces are compact.
+template<int M, int LUT>
+void indexed_cache_ops(torch::Tensor positions, torch::Tensor selected,
+    torch::Tensor offsets, torch::Tensor counts, torch::Tensor slots,
+    torch::Tensor lengths, int heads) {
+    reorder_keys_and_mixed_offsets<int64_t, M, LUT>
+        <<<slots.numel() * heads, M, 0, at::cuda::getCurrentCUDAStream()>>>(
+            positions.data_ptr<int64_t>(), selected.data_ptr<int64_t>(),
+            positions.data_ptr<int64_t>(), offsets.data_ptr<int>(), counts.data_ptr<int>(),
+            slots.data_ptr<int>(), lengths.data_ptr<int>(), heads);
+}
+
+void reorder_keys_indexed(torch::Tensor positions, torch::Tensor selected,
+    torch::Tensor offsets, torch::Tensor counts, torch::Tensor slots,
+    torch::Tensor lengths, int heads, int map_size) {
+    switch (map_size) {
+        case 128: indexed_cache_ops<128,1024>(positions,selected,offsets,counts,slots,lengths,heads); break;
+        case 256: indexed_cache_ops<256,1024>(positions,selected,offsets,counts,slots,lengths,heads); break;
+        case 512: indexed_cache_ops<512,2048>(positions,selected,offsets,counts,slots,lengths,heads); break;
+        case 1024: indexed_cache_ops<1024,4096>(positions,selected,offsets,counts,slots,lengths,heads); break;
+        default: TORCH_CHECK(false, "Unsupported ShadowKV selection size");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template<int M>
+void indexed_gather(torch::Tensor values, torch::Tensor cache, torch::Tensor temp,
+    torch::Tensor offsets, torch::Tensor counts, torch::Tensor signals,
+    torch::Tensor slots, torch::Tensor starts, torch::Tensor lengths,
+    int heads, int cpu_stride, int cache_stride, bool key_only) {
+    int smem = CPY_SIZE * 2 * 1024 + M * 4 + sizeof(PTYPE);
+    if (key_only) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(gather_copy_d2d<PTYPE,M>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        gather_copy_d2d<PTYPE,M><<<slots.numel()*heads, BLOCK_SIZE_CP, smem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<PTYPE*>(cache.data_ptr<at::BFloat16>()), nullptr,
+            M*8*128, 0, cache_stride, offsets.data_ptr<int>(), 0, counts.data_ptr<int>(),
+            slots.data_ptr<int>(), starts.data_ptr<int>(), lengths.data_ptr<int>(), heads);
+    } else {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(gather_copy_var_midpoint_BP<PTYPE,M>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        gather_copy_var_midpoint_BP<PTYPE,M><<<slots.numel()*heads*2, BLOCK_SIZE_CP, smem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<PTYPE*>(values.data_ptr<at::BFloat16>()),
+            reinterpret_cast<PTYPE*>(temp.data_ptr<at::BFloat16>()),
+            reinterpret_cast<PTYPE*>(cache.data_ptr<at::BFloat16>()),
+            cpu_stride, M*8*128, 0, cache_stride, offsets.data_ptr<int>(), counts.data_ptr<int>(),
+            reinterpret_cast<unsigned int*>(signals.data_ptr<int>()), slots.data_ptr<int>(),
+            starts.data_ptr<int>(), lengths.data_ptr<int>(), heads);
+    }
+}
+
+void gather_copy_indexed(torch::Tensor values, torch::Tensor cache, torch::Tensor temp,
+    torch::Tensor offsets, torch::Tensor counts, torch::Tensor signals,
+    torch::Tensor slots, torch::Tensor starts, torch::Tensor lengths,
+    int heads, int cpu_stride, int cache_stride, int map_size, bool key_only) {
+    switch (map_size) {
+#define LAUNCH(M) case M: indexed_gather<M>(values,cache,temp,offsets,counts,signals,slots,starts,lengths,heads,cpu_stride,cache_stride,key_only); break;
+        LAUNCH(128) LAUNCH(256) LAUNCH(512) LAUNCH(1024)
+#undef LAUNCH
+        default: TORCH_CHECK(false, "Unsupported ShadowKV selection size");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

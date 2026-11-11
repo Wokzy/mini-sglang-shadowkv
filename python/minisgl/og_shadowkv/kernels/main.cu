@@ -22,6 +22,9 @@
 #include "functions.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("batch_gemm_softmax_indexed", &batch_gemm_softmax_indexed);
+    m.def("reorder_keys_indexed", &reorder_keys_indexed);
+    m.def("gather_copy_indexed", &gather_copy_indexed);
     m.def("gather_copy", &gather_copy, "Gather-Copy (CUDA)");
     m.def("gather_copy_d2d_with_offsets", &gather_copy_d2d_with_offsets, "Gather-Copy D2D with offsets for keys (CUDA)");
     m.def("reorder_keys_and_compute_offsets", &reorder_keys_and_compute_offsets, "Reorder keys and compute offsets (CUDA)");

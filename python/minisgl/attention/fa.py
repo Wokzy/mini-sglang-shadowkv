@@ -34,6 +34,7 @@ class FAMetadata(BaseAttnMetadata):
 
     page_table: torch.Tensor
     cache_batch_idx: torch.Tensor
+    og_max_landmarks: int = 0
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -109,18 +110,16 @@ class FlashAttentionBackend(BaseAttnBackend):
         h, d = self.config.num_kv_heads, self.config.head_dim
         k, v = k.view(-1, h, d), v.view(-1, h, d)
         if batch.is_decode:
-            for i, req in enumerate(batch.reqs):
-                if req.extend_len != 1:
-                    raise ValueError("Original ShadowKV decode requires one token per request")
-                self.kvcache.decode(
-                    req.table_idx,
-                    layer_id,
-                    q[i : i + 1],
-                    k[i : i + 1],
-                    v[i : i + 1],
-                    req.device_len,
-                )
             metadata: FAMetadata = batch.attn_metadata
+            self.kvcache.decode_batch(
+                layer_id,
+                q,
+                k,
+                v,
+                metadata.cache_batch_idx,
+                metadata.cache_seqlens,
+                metadata.og_max_landmarks,
+            )
             # Transpose is a view. The gather kernels keep their head-major
             # layout; FA accepts these strides without repacking the cache.
             return flash3_kvcache_impl(
@@ -195,7 +194,11 @@ class FlashAttentionBackend(BaseAttnBackend):
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
 
+        og_max_landmarks = 0
         if self.shadowkv_enabled == "OGShadowKV" and batch.is_decode:
+            if any(n != 1 for n in seqlens_q):
+                raise ValueError("Original ShadowKV decode requires one token per request")
+            og_max_landmarks = self.kvcache.max_landmarks([req.table_idx for req in reqs])
             seqlens_k = self.kvcache.decode_lengths(seqlens_k, [req.table_idx for req in reqs])
 
         max_seqlen_k = max(seqlens_k)
@@ -238,6 +241,7 @@ class FlashAttentionBackend(BaseAttnBackend):
                 cache_seqlens = cache_seqlens.to(device, non_blocking=True)
 
         batch.attn_metadata = FAMetadata(
+            og_max_landmarks=og_max_landmarks,
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
             cache_seqlens=cache_seqlens,

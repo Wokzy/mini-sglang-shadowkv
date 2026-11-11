@@ -358,9 +358,17 @@ __global__ void gather_copy_d2d(
     int d_buffer_stride,
     int *offsets,
     int start,
-    int *end_cnts)
+    int *end_cnts,
+    const int *slots = nullptr, const int *starts = nullptr, const int *lengths = nullptr, int heads = 0)
 {
 
+    if (slots) {
+        int slot = slots[blockIdx.x / heads];
+        if (lengths[slot] == 0) return;
+        int64_t delta = int64_t(slot * heads + blockIdx.x % heads) - blockIdx.x;
+        d_values += delta * d_buffer_stride * 2 / sizeof(T);
+        d_buffer_offset = starts[slot] * 128;
+    }
     extern __shared__ int s[];
     int *s_offsets = s;                // BLOCK_SIZE_MAP
     int *end_cnt = s + MAP_SIZE; // 1, but occupy 2 to avoid alignment issue
@@ -443,7 +451,8 @@ __global__ void gather_copy_var_midpoint_BP(
     int d_buffer_stride,
     int *offsets,
     int *cnts,
-    unsigned int *signals)
+    unsigned int *signals,
+    const int *slots = nullptr, const int *starts = nullptr, const int *lengths = nullptr, int heads = 0)
 {
 
     extern __shared__ int s[];
@@ -452,6 +461,14 @@ __global__ void gather_copy_var_midpoint_BP(
     T *s_data = (T *)(cnt + sizeof(T) / 4);
 
     int bid = blockIdx.x >> 1;
+    if (slots) {
+        int slot = slots[bid / heads];
+        if (lengths[slot] == 0) return;
+        int64_t delta = int64_t(slot * heads + bid % heads) - bid;
+        h_values += delta * h_buffer_size * 2 / sizeof(T);
+        d_values += delta * d_buffer_stride * 2 / sizeof(T);
+        d_buffer_offset = starts[slot] * 128;
+    }
     int bs_task = blockIdx.x & 1; // 0 or 1
 
     int key_offset = bid * MAP_SIZE + threadIdx.x;

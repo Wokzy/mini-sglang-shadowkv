@@ -19,6 +19,7 @@
 
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include <assert.h>
@@ -195,4 +196,74 @@ void batch_gemm_softmax(
     CUTLASS_CHECK(batch_gemm_softmax.initialize(args));
 
     CUTLASS_CHECK(batch_gemm_softmax(at::cuda::getCurrentCUDAStream()));
+}
+
+using IndexedGemm = BatchGemmSoftmax::GemmKernel;
+using IndexedReduction = BatchGemmSoftmax::ApplyFinalReductionKernel;
+using IndexedSoftmax = BatchGemmSoftmax::SoftmaxApplyKernel;
+
+__global__ void indexed_gemm(IndexedGemm::Params params, const int* slots,
+                            const int* lengths, int heads, int64_t query_stride) {
+    int active = blockIdx.z / heads;
+    int slot = slots[active];
+    int n = lengths[slot];
+    if (n == 0 || blockIdx.y * ThreadblockShape::kN >= n) return;
+    params.problem_size.n() = n;
+    params.ptr_A = static_cast<ElementA*>(params.ptr_A) +
+        int64_t(active) * (query_stride - heads * params.batch_stride_A);
+    params.ptr_B = static_cast<ElementB*>(params.ptr_B) +
+        int64_t(slot - active) * heads * params.batch_stride_B;
+    extern __shared__ int shared[];
+    IndexedGemm op;
+    op(params, *reinterpret_cast<IndexedGemm::SharedStorage*>(shared));
+}
+
+__global__ void indexed_reduction(IndexedReduction::Params params,
+                                 const int* slots, const int* lengths, int heads) {
+    int n = lengths[slots[blockIdx.z / heads]];
+    if (n == 0) return;
+    params.args.problem_size.n() = n;
+    extern __shared__ int shared[];
+    IndexedReduction op;
+    op(params, *reinterpret_cast<IndexedReduction::SharedStorage*>(shared));
+}
+
+__global__ void indexed_softmax(IndexedSoftmax::Params params,
+                               const int* slots, const int* lengths, int heads) {
+    int n = lengths[slots[blockIdx.z / heads]];
+    if (n == 0) return;
+    params.args.extent.column() = n;
+    extern __shared__ int shared[];
+    IndexedSoftmax op;
+    op(params, *reinterpret_cast<IndexedSoftmax::SharedStorage*>(shared));
+}
+
+void batch_gemm_softmax_indexed(torch::Tensor A, torch::Tensor B,
+    torch::Tensor D, torch::Tensor Norm, torch::Tensor Sum, torch::Tensor Softmax,
+    torch::Tensor slots, torch::Tensor lengths, int heads, int m, int max_n) {
+    int n = B.size(2), k = 128;
+    int batches = slots.numel() * heads;
+    int blocks = (n + 255) / 256;
+    BatchGemmSoftmax::Arguments args(
+        {m,max_n,k}, batches,
+        {reinterpret_cast<ElementA*>(A.data_ptr()), k},
+        {reinterpret_cast<ElementB*>(B.data_ptr()), k},
+        {nullptr,n}, {reinterpret_cast<ElementD*>(D.data_ptr()),n},
+        {float(1.0 / sqrt(128.0)),0.0f},
+        {Norm.data_ptr<float>(),m}, {Sum.data_ptr<float>(),m},
+        {reinterpret_cast<ElementSoftmax*>(Softmax.data_ptr()),n},
+        m*k, int64_t(n)*k, m*n, m*n, blocks*m, blocks*m, m*n);
+    BatchGemmSoftmax::Params params(args);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int smem = sizeof(IndexedGemm::SharedStorage);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(indexed_gemm,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    indexed_gemm<<<dim3((m+31)/32,(max_n+255)/256,batches),IndexedGemm::kThreadCount,smem,stream>>>(
+        params.gemm, slots.data_ptr<int>(), lengths.data_ptr<int>(), heads, A.stride(0));
+    indexed_reduction<<<dim3((m+31)/32,1,batches),32,sizeof(IndexedReduction::SharedStorage),stream>>>(
+        params.reduction, slots.data_ptr<int>(), lengths.data_ptr<int>(), heads);
+    // The original ApplySoftmax loops over N internally; one CTA per query row.
+    indexed_softmax<<<dim3(m,1,batches),1024,sizeof(IndexedSoftmax::SharedStorage),stream>>>(
+        params.softmax, slots.data_ptr<int>(), lengths.data_ptr<int>(), heads);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

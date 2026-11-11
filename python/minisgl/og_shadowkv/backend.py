@@ -67,30 +67,27 @@ class OGShadowKVConfig:
 @dataclass
 class _LayerCache:
     # K/V, landmarks, landmark IDs, and values are shared-pool views.
-    # SVD factors and hit/miss state remain request-specific.
+    # All persistent tensors are views of fixed-capacity slot pools.
     k: torch.Tensor
     v: torch.Tensor
     prompt_len: int
     sparse_start: int
     sparse_end: int
-    length: int
     u: torch.Tensor | None = None
     sv: torch.Tensor | None = None
     values: torch.Tensor | None = None
     landmarks: torch.Tensor | None = None
     landmark_ids: torch.Tensor | None = None
     positions: torch.Tensor | None = None
-    fast: bool = False
-    workspace: tuple = ()
 
 
 class ShadowKVCache_CPU:
     """Original ShadowKV with independent state for each scheduler request slot.
 
-    The original fused scoring, cache-hit reuse, CPU value gathering and key
-    reconstruction kernels are retained for their supported shapes. Unsupported
-    sparse decode shapes raise RuntimeError. Short prompts use exact KV.
-    Only full prompt prefills and one-token decoding are supported.
+    Original scoring and cache-hit/value-gather kernels accept active slot
+    indices. A Triton gather/GEMM/RoPE kernel reconstructs missing keys into the
+    shared K pool. Unsupported configurations fail at initialization. Short
+    prompts retain exact KV. Prefill is per request; decode is one batch per layer.
     """
 
     def __init__(
@@ -122,33 +119,71 @@ class ShadowKVCache_CPU:
         self.outlier_chunk = shadowkv_config.outliers_budget
         self.local_chunk = shadowkv_config.local_chunks_count
         self.max_out_len = shadowkv_config.max_out_len
+        if (
+            dtype != torch.bfloat16
+            or self.head_dim != 128
+            or not 1 <= self.num_key_value_heads <= 16
+            or self.chunk_size != 8
+            or self.rank % 8
+            or self.rank > self.num_key_value_heads * self.head_dim
+            or self.select_sets not in (128, 256, 512, 1024)
+            or self.outlier_chunk % 8
+            or self.local_chunk < 0
+            or config.num_qo_heads % config.num_kv_heads
+            or max_length % 64
+        ):
+            raise ValueError(
+                "Unsupported original ShadowKV shape: requires BF16, head_dim=128, "
+                "1..16 KV heads, chunk_size=8, rank aligned to 8, "
+                "128/256/512/1024 selected chunks, outliers aligned to 8, max_length aligned to 64"
+            )
         # Rounding the context chunk count down to a multiple of eight leaves
         # up to seven extra full chunks and a partial chunk in the local suffix.
         # This bound also accommodates every short prompt using the dense path.
         prompt_capacity = (
             self.sparse_budget + (self.outlier_chunk + self.local_chunk + 8) * self.chunk_size
-            if self.select_sets
-            else max_length  # A zero sparse budget retains the full context.
         )
         self.cache_capacity = min(max_length, prompt_capacity) + self.max_out_len + 1
-        # +1 allows the scheduler's extra in-flight decode after completion.
-        shape = (
-            self.num_layers,
-            batch_size,
-            self.num_key_value_heads,
-            self.cache_capacity,
-            self.head_dim,
-        )
-        self.k_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
-        self.v_cache_buffer = torch.empty(shape, device=self.device, dtype=self.dtype)
 
-        # Fixed-capacity backing storage, matching the reference's layer/batch/
-        # head layout. Active requests use compact prefix views of each slot:
-        # the fused kernels infer head strides from the actual request length.
+        # +1 allows the scheduler's extra in-flight decode after completion.
+        # FA3 may load padded V lanes even with cache_seqlens. Zero the pools
+        # once so 0 * an uninitialized NaN cannot contaminate attention output.
+        self.k_cache_buffer = torch.zeros(
+            (
+                self.num_layers,
+                batch_size,
+                self.num_key_value_heads,
+                self.cache_capacity,
+                self.head_dim,
+            ),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.v_cache_buffer = torch.zeros(
+            (
+                self.num_layers,
+                batch_size,
+                self.num_key_value_heads,
+                self.cache_capacity,
+                self.head_dim,
+            ),
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        # Fixed strides for layer/slot/head; kernels receive valid lengths and
+        # active slot indices, so no full-cache packing is needed at decode.
         self.max_chunks = max_length // self.chunk_size
-        shape = (self.num_layers, batch_size, self.num_key_value_heads, self.max_chunks)
-        self.k_landmark = torch.empty((*shape, self.head_dim), device=self.device, dtype=dtype)
-        self.k_landmark_idx = torch.empty(shape, device=self.device, dtype=torch.int64)
+        self.k_landmark = torch.empty(
+            (self.num_layers, batch_size, self.num_key_value_heads, self.max_chunks, self.head_dim),
+            device=self.device,
+            dtype=dtype,
+        )
+        self.k_landmark_idx = torch.empty(
+            (self.num_layers, batch_size, self.num_key_value_heads, self.max_chunks),
+            device=self.device,
+            dtype=torch.int64,
+        )
 
         logger.info(
             "Allocated original ShadowKV landmarks pool: %.2f GiB on %s",
@@ -158,11 +193,37 @@ class ShadowKVCache_CPU:
         )
 
         self.v_cache_cpu = torch.empty(
-            (*shape, self.chunk_size * self.head_dim),
+            (
+                self.num_layers,
+                batch_size,
+                self.num_key_value_heads,
+                self.max_chunks,
+                self.chunk_size * self.head_dim,
+            ),
             device="cpu" if shadowkv_config.enable_offloading else self.device,
             dtype=dtype,
             pin_memory=shadowkv_config.enable_offloading,
         )
+
+        self.svd_u = torch.empty(
+            (self.num_layers, batch_size, self.max_length, self.rank),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        self.svd_sv = torch.empty(
+            (
+                self.num_layers,
+                batch_size,
+                self.rank,
+                self.head_dim * self.num_key_value_heads,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # SV is the singular-value-weighted right factor (also called V).
+        self.svd_v = self.svd_sv
 
         logger.info(
             "Allocated original ShadowKV value pool: %.2f GiB on %s",
@@ -170,6 +231,40 @@ class ShadowKVCache_CPU:
             self.v_cache_cpu.device,
         )
 
+        # Persistent cache state is layer/slot indexed. Scratch is shared by
+        # layers and indexed by the current compact batch (all launches ordered
+        # on the engine stream, with the value stream joined before returning).
+        self.positions = torch.empty(
+            (self.num_layers, batch_size, self.num_key_value_heads, self.select_sets),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.landmark_lengths = torch.zeros(batch_size, device=self.device, dtype=torch.int32)
+        self.sparse_starts = torch.zeros_like(self.landmark_lengths)
+        b, h, g, n = (
+            batch_size,
+            self.num_key_value_heads,
+            self.num_key_value_groups,
+            self.max_chunks,
+        )
+        self.gemm = torch.empty((b, h, g, n), device=self.device, dtype=dtype)
+        self.softmax = torch.empty_like(self.gemm)
+        self.norm = torch.empty(
+            (b * h, (n + 255) // 256, g), device=self.device, dtype=torch.float32
+        )
+        self.sums = torch.empty_like(self.norm)
+        self.scores = torch.empty((b, h, n), device=self.device, dtype=dtype)
+        self.top_values = torch.empty((b, h, self.select_sets), device=self.device, dtype=dtype)
+        self.top_indices = torch.empty(
+            (b, h, self.select_sets), device=self.device, dtype=torch.int64
+        )
+        self.selected = torch.empty_like(self.top_indices)
+        self.offsets = torch.empty((b, h, self.select_sets), device=self.device, dtype=torch.int32)
+        self.counts = torch.empty((b, h), device=self.device, dtype=torch.int32)
+        self.signals = torch.zeros((b, h), device=self.device, dtype=torch.int32)
+        self.temp = torch.empty(
+            (b, h, self.sparse_budget, self.head_dim), device=self.device, dtype=dtype
+        )
         self.slots: dict[int, dict[int, _LayerCache]] = {}
         self._pre_rope: torch.Tensor | None = None
         self._rope_cache: torch.Tensor | None = None
@@ -226,6 +321,8 @@ class ShadowKVCache_CPU:
             state = self._make_layer_cache(slot, layer, n, n, n)
             state.k[0, :, :n].copy_(k.transpose(0, 1))
             state.v[0, :, :n].copy_(v.transpose(0, 1))
+            self.landmark_lengths[slot] = 0
+            self.sparse_starts[slot] = n
             self.slots[slot][layer] = state
             return
 
@@ -243,16 +340,12 @@ class ShadowKVCache_CPU:
         keep = torch.ones_like(all_ids, dtype=torch.bool).scatter_(-1, outliers, False)
         ids = all_ids[keep].reshape(1, h, chunks - self.outlier_chunk)
         num_landmarks = ids.shape[-1]
-        state.landmark_ids = (
-            self.k_landmark_idx[layer, slot].view(-1)[: h * num_landmarks].view(1, h, num_landmarks)
-        )
+        state.landmark_ids = self.k_landmark_idx[layer, slot : slot + 1, :, :num_landmarks]
         state.landmark_ids.copy_(ids)
-        state.landmarks = (
-            self.k_landmark[layer, slot]
-            .view(-1)[: h * num_landmarks * d]
-            .view(1, h, num_landmarks, d)
-        )
+        state.landmarks = self.k_landmark[layer, slot : slot + 1, :, :num_landmarks]
         state.landmarks.copy_(means.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, d)))
+        self.landmark_lengths[slot] = num_landmarks
+        self.sparse_starts[slot] = start
         state.k[:, :, :local].copy_(keys[:, :, -local:])
         state.v[:, :, :local].copy_(values[:, :, -local:])
         outlier_tokens = self._token_ids(outliers)
@@ -262,40 +355,27 @@ class ShadowKVCache_CPU:
         # Decompose all heads together, as in the authors' implementation.
         matrix = pre_k.reshape(n, h * d).float()
         u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
-        rank = min(self.rank, s.numel())
-        state.u = u[:, :rank].to(self.dtype).unsqueeze(0).contiguous()
-        state.sv = (
-            (s[:rank, None] * vh[:rank])
-            .to(self.dtype)
-            .reshape(rank, h, d)
-            .permute(1, 2, 0)
-            .unsqueeze(0)
-            .contiguous()
-        )
-        state.values = (
-            self.v_cache_cpu[layer, slot].view(-1)[: h * chunks * c * d].view(1, h, chunks * c, d)
-        )
+        if s.numel() < self.rank:
+            raise ValueError("Original ShadowKV rank exceeds the prompt matrix rank dimension")
+        state.u = self.svd_u[layer, slot : slot + 1, :n]
+        state.u.copy_(u[:, : self.rank].to(self.dtype).unsqueeze(0))
+        self.svd_sv[layer, slot].copy_((s[: self.rank, None] * vh[: self.rank]).to(self.dtype))
+        # Preserve the useful [1, heads, dim, rank] reference view without copying.
+        state.sv = self.svd_sv[layer, slot : slot + 1].view(1, self.rank, h, d).permute(0, 2, 3, 1)
+        state.values = self.v_cache_cpu[layer, slot : slot + 1].view(1, h, self.max_chunks * c, d)[
+            :, :, : chunks * c
+        ]
         # Blocking D2H ensures the CPU cache is ready for mapped reads. The
         # pinned allocation is reused; only the valid prefix is written.
         state.values.copy_(values[:, :, : chunks * c])
 
         # Initialize exact selected keys. Subsequent hits preserve these keys;
         # misses use the low-rank reconstruction, matching the original cache.
-        state.positions = self._select(state, q[-1:]).contiguous()
+        state.positions = self.positions[layer, slot : slot + 1]
+        state.positions.copy_(self._select_prefill(state, q[-1:]))
         token_ids = self._token_ids(state.positions)
         state.k[:, :, start:end].copy_(self._gather(keys, token_ids))
         state.v[:, :, start:end].copy_(self._gather(values, token_ids))
-        state.fast = (
-            self.dtype == torch.bfloat16
-            and d == 128
-            and h <= 16
-            and c == 8
-            and rank % 8 == 0
-            and self.select_sets in (128, 256, 512, 1024)
-            and ids.shape[-1] % 8 == 0
-        )
-        if state.fast:
-            self._init_workspace(state)
         self.slots[slot][layer] = state
 
     def _make_layer_cache(self, slot, layer, prompt_len, start, end):
@@ -307,34 +387,21 @@ class ShadowKVCache_CPU:
             prompt_len,
             start,
             end,
-            end,
         )
 
     def decode_lengths(self, sequence_lengths, slots):
         # Lengths are layer-independent and returned in active query order,
         # whereas the backing K/V storage remains in persistent slot order.
-        return [
-            self.slots[slot][0].sparse_end + length - self.slots[slot][0].prompt_len
-            for slot, length in zip(slots, sequence_lengths)
-        ]
-
-    def _init_workspace(self, state):
-        h, g, n = self.num_key_value_heads, self.num_key_value_groups, state.landmarks.shape[-2]
-
-        def empty(shape, dtype=self.dtype):
-            return torch.empty(shape, device=self.device, dtype=dtype)
-
-        state.workspace = (
-            empty((1, h, g, n)),
-            empty((1, h, g, n)),
-            empty((h, g, (n + 255) // 256), torch.float32),
-            empty((h, g, (n + 255) // 256), torch.float32),
-            empty((h * self.select_sets,), torch.int32),
-            empty((h,), torch.int32),
-            torch.zeros(h, device=self.device, dtype=torch.int32),
-            empty((1, h, self.sparse_budget, self.head_dim)),
-            empty((1, h, self.sparse_budget, self.head_dim)),
-        )
+        result = []
+        for slot, length in zip(slots, sequence_lengths):
+            state = self.slots[slot][0]
+            generated = length - state.prompt_len
+            if not 1 <= generated <= self.max_out_len + 1:
+                raise RuntimeError(
+                    "Original ShadowKV decode exceeds max_out_len and overlap allowance"
+                )
+            result.append(state.sparse_end + generated)
+        return result
 
     def _token_ids(self, ids):
         return (
@@ -344,141 +411,163 @@ class ShadowKVCache_CPU:
     def _gather(self, tensor, ids):
         return tensor.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim))
 
-    def _select(self, state, q):
+    def _select_prefill(self, state, q):
         q = q.reshape(1, self.num_key_value_heads, self.num_key_value_groups, self.head_dim)
-        if state.fast:
-            from minisgl import og_shadowkv_kernels as kernels
-
-            gemm, softmax, norm, sums, *_ = state.workspace
-            kernels.batch_gemm_softmax(
-                q.contiguous(),
-                state.landmarks,
-                gemm,
-                norm,
-                sums,
-                softmax,
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                state.landmarks.shape[-2],
-                self.head_dim,
-                self.head_dim**-0.5,
-                0.0,
-            )
-            scores = softmax.amax(dim=2)
-        else:
-            logits = torch.matmul(q, state.landmarks.transpose(-1, -2)) * self.head_dim**-0.5
-            scores = logits.softmax(-1, dtype=torch.float32).to(self.dtype).amax(dim=2)
+        logits = torch.matmul(q, state.landmarks.transpose(-1, -2)) * self.head_dim**-0.5
+        scores = logits.softmax(-1, dtype=torch.float32).to(self.dtype).amax(dim=2)
         indices = scores.topk(self.select_sets, dim=-1).indices
         return state.landmark_ids.gather(-1, indices)
 
-    def decode(
-        self,
-        slot: int,
-        layer: int,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        sequence_len: int,
-    ):
-        state = self.slots[slot][layer]
-        generated = sequence_len - state.prompt_len
-        length = state.sparse_end + generated
-        if generated > self.max_out_len + 1:
-            raise RuntimeError("Original ShadowKV decode exceeds max_out_len and overlap allowance")
-        if length > state.k.shape[-2] or length != state.length + 1:
-            raise RuntimeError(f"Invalid ShadowKV decode length for slot {slot}: {length}")
-        state.k[0, :, length - 1].copy_(k.reshape(self.num_key_value_heads, self.head_dim))
-        state.v[0, :, length - 1].copy_(v.reshape(self.num_key_value_heads, self.head_dim))
-        if state.landmarks is not None:
-            selected = self._select(state, q)
-            if state.fast:
-                self._decode_fast(state, selected)
-            else:
-                self._decode_torch(state, selected)
-        state.length = length
-        # FlashAttention consumes [batch, tokens, heads, dim].
-        return state.k[:, :, :length].transpose(1, 2), state.v[:, :, :length].transpose(1, 2)
+    def max_landmarks(self, slots):
+        return max(
+            (self.slots[s][0].landmarks.shape[-2] if self.slots[s][0].landmarks is not None else 0)
+            for s in slots
+        )
 
-    def _decode_fast(self, state, selected):
+    def select_batch(self, layer, q, slots, max_landmarks):
+        """Original fused scoring, GQA max and top-k, once for the active batch."""
+        import triton
+
         from minisgl import og_shadowkv_kernels as kernels
-        from .tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 
-        _, _, _, _, offsets, counts, signals, temp, output = state.workspace
-        h, d, budget = self.num_key_value_heads, self.head_dim, self.sparse_budget
-        kernels.reorder_keys_and_compute_offsets(
-            state.positions, selected.contiguous(), offsets, counts, 1, h, self.select_sets
+        from .batched_kernels import reduce_scores, selected_chunk_ids
+
+        b, h, g = slots.numel(), self.num_key_value_heads, self.num_key_value_groups
+        kernels.batch_gemm_softmax_indexed(
+            q,
+            self.k_landmark[layer],
+            self.gemm,
+            self.norm,
+            self.sums,
+            self.softmax,
+            slots,
+            self.landmark_lengths,
+            h,
+            g,
+            max_landmarks,
+        )
+        reduce_scores[(b * h, triton.cdiv(max_landmarks, 256))](
+            self.softmax,
+            self.scores,
+            slots,
+            self.landmark_lengths,
+            h,
+            g,
+            max_landmarks,
+            self.max_chunks,
+            triton.next_power_of_2(g),
+        )
+        torch.topk(
+            self.scores[:b, :, :max_landmarks],
+            self.select_sets,
+            dim=-1,
+            out=(self.top_values[:b], self.top_indices[:b]),
+        )
+        selected_chunk_ids[(b * h,)](
+            self.top_indices,
+            self.k_landmark_idx[layer],
+            self.selected,
+            slots,
+            self.landmark_lengths,
+            h,
+            self.max_chunks,
+            self.select_sets,
+            self.select_sets,
+        )
+        return self.selected[:b]
+
+    def decode_batch(self, layer, q, k, v, slots, lengths, max_landmarks):
+        """One launch per stage for arbitrary active slots and prompt lengths.
+
+        lengths are assembled KV lengths in query order (FA metadata). They
+        already include the generated token; persistent cache rows use slot order.
+        """
+        import triton
+
+        from minisgl import og_shadowkv_kernels as kernels
+
+        from .batched_kernels import append_kv, reconstruct_keys
+
+        b, h = slots.numel(), self.num_key_value_heads
+        append_kv[(b,)](
+            k,
+            v,
+            self.k_cache_buffer[layer],
+            self.v_cache_buffer[layer],
+            slots,
+            lengths,
+            h,
+            self.cache_capacity,
+            k.stride(0),
+            v.stride(0),
+            triton.next_power_of_2(h * 128),
+        )
+        if not max_landmarks:
+            return
+        selected = self.select_batch(layer, q, slots, max_landmarks)
+        kernels.reorder_keys_indexed(
+            self.positions[layer],
+            selected,
+            self.offsets,
+            self.counts,
+            slots,
+            self.landmark_lengths,
+            h,
+            self.select_sets,
         )
         current = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current)
         with torch.cuda.stream(self.copy_stream):
-            kernels.gather_copy_with_offsets(
-                state.values,
-                state.v,
-                temp,
-                offsets,
-                counts,
-                signals,
-                1,
+            kernels.gather_copy_indexed(
+                self.v_cache_cpu[layer],
+                self.v_cache_buffer[layer],
+                self.temp,
+                self.offsets,
+                self.counts,
+                self.signals,
+                slots,
+                self.sparse_starts,
+                self.landmark_lengths,
                 h,
-                state.values.shape[-2] * d,
-                budget * d,
-                state.sparse_start * d,
-                state.v.shape[-2] * d,
+                self.max_chunks * 8 * 128,
+                self.cache_capacity * 128,
                 self.select_sets,
+                False,
             )
-        kernels.gather_copy_d2d_with_offsets(
-            state.k,
-            offsets,
-            counts,
-            1,
+        kernels.gather_copy_indexed(
+            self.v_cache_cpu[layer],
+            self.k_cache_buffer[layer],
+            self.temp,
+            self.offsets,
+            self.counts,
+            self.signals,
+            slots,
+            self.sparse_starts,
+            self.landmark_lengths,
             h,
-            budget * d,
-            state.sparse_start * d,
-            state.k.shape[-2] * d,
+            self.max_chunks * 8 * 128,
+            self.cache_capacity * 128,
             self.select_sets,
+            True,
         )
-        batch_gather_gemm_rotary_pos_emb_cuda(
-            state.u,
-            state.sv,
+        reconstruct_keys[(triton.cdiv(self.sparse_budget, 32), b * h)](
+            self.svd_u[layer],
+            self.svd_sv[layer],
             self._rope_cache,
-            state.positions,
-            output,
-            self.chunk_size,
-            state.k,
-            state.sparse_start,
-            state.sparse_end,
-            counts,
+            self.positions[layer],
+            self.counts,
+            slots,
+            self.sparse_starts,
+            self.landmark_lengths,
+            self.k_cache_buffer[layer],
+            h,
+            self.max_length,
+            self.rank,
+            self.cache_capacity,
+            self.select_sets,
+            enable_fp_fusion=False,
         )
         current.wait_stream(self.copy_stream)
-
-    def _decode_torch(self, state, selected):
-        raise RuntimeError(
-            "You've tried to use unefficient implementation of Original ShadowKV. Make sure it is intented, then remove this `raise`"
-        )
-        # Retain cached (possibly exact-prefill) keys on hits, just like the
-        # fused path. This fallback handles arbitrary budgets and head shapes.
-        matches = selected.unsqueeze(-1) == state.positions.unsqueeze(-2)
-        hits = matches.any(-1)
-        old_ids = matches.to(torch.int32).argmax(-1)
-        old_tokens = self._token_ids(old_ids)
-        old_keys = self._gather(state.k[:, :, state.sparse_start : state.sparse_end], old_tokens)
-        ids = self._token_ids(selected)
-        u = state.u[:, None].expand(-1, self.num_key_value_heads, -1, -1)
-        u = u.gather(2, ids.unsqueeze(-1).expand(-1, -1, -1, u.shape[-1]))
-        keys = torch.matmul(u, state.sv.transpose(-1, -2))
-        cs = self._rope_cache[ids].float()
-        cos, sin = cs.chunk(2, -1)
-        x, y = keys.float().chunk(2, -1)
-        keys = torch.cat((x * cos - y * sin, y * cos + x * sin), -1).to(self.dtype)
-        keys = torch.where(
-            hits.repeat_interleave(self.chunk_size, -1).unsqueeze(-1), old_keys, keys
-        )
-        # Only selected values cross PCIe; never copy the entire host cache.
-        value_ids = ids.cpu() if state.values.device.type == "cpu" else ids
-        values = self._gather(state.values, value_ids).to(self.device)
-        state.k[:, :, state.sparse_start : state.sparse_end].copy_(keys)
-        state.v[:, :, state.sparse_start : state.sparse_end].copy_(values)
-        state.positions = selected
 
     def clear(self):
         self.copy_stream.synchronize()
