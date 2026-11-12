@@ -28,6 +28,12 @@ from minisgl.distributed import get_tp_info
 from minisgl.models.config import ModelConfig
 from minisgl.utils import init_logger
 
+import triton
+
+from minisgl import og_shadowkv_kernels as kernels
+
+from .batched_kernels import reduce_scores, selected_chunk_ids
+
 logger = init_logger(__name__)
 
 
@@ -202,8 +208,11 @@ class ShadowKVCache_CPU:
             ),
             device="cpu" if shadowkv_config.enable_offloading else self.device,
             dtype=dtype,
-            pin_memory=shadowkv_config.enable_offloading,
+            pin_memory=False,
         )
+
+        if shadowkv_config.enable_offloading:
+            kernels.pin_cpu_tensor(self.v_cache_cpu)
 
         self.svd_u = torch.empty(
             (self.num_layers, batch_size, self.max_length, self.rank),
@@ -426,11 +435,6 @@ class ShadowKVCache_CPU:
 
     def select_batch(self, layer, q, slots, max_landmarks):
         """Original fused scoring, GQA max and top-k, once for the active batch."""
-        import triton
-
-        from minisgl import og_shadowkv_kernels as kernels
-
-        from .batched_kernels import reduce_scores, selected_chunk_ids
 
         b, h, g = slots.numel(), self.num_key_value_heads, self.num_key_value_groups
         kernels.batch_gemm_softmax_indexed(
