@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.kernel.magicpig import append_kv
 from minisgl.magicpig import NativeMagicPIG, hash_vectors, partition_prompt
 from minisgl.utils import div_even, init_logger
 
@@ -67,6 +68,8 @@ class MagicPIGPool:
         self.projection = torch.randn(
             self.head_dim, config.hash_bits * config.hash_tables, generator=generator
         ).to(device=device, dtype=dtype)
+        self.offload_stream = torch.cuda.Stream(device=device)
+        self.pending_fill = None
         self.prompt_lengths = [0] * max_batch_size
         self.request_ids = [None] * max_batch_size
         # CPU memory is not covered by --memory-ratio. Report the dominant native allocations.
@@ -88,7 +91,27 @@ class MagicPIGPool:
             f"MagicPIG GPU KV storage: {sum(t.numel() * t.element_size() for t in self.cache) / 2**30:.2f} GiB"
         )
 
+    def finish_prefill(self):
+        if self.pending_fill is not None:
+            pending, self.pending_fill = self.pending_fill, None
+            pending()  # Complete the previous layer while subsequent GPU work runs.
+
+    def close(self):
+        try:
+            self.finish_prefill()
+        finally:
+            self.offload_stream.synchronize()
+
     def fill(self, layer, slot, k, v):
+        # At most one layer's CPU fill is pending: bounded staging memory.
+        self.finish_prefill()
+        self.offload_stream.wait_stream(torch.cuda.current_stream())
+        k.record_stream(self.offload_stream)
+        v.record_stream(self.offload_stream)
+        with torch.cuda.stream(self.offload_stream):
+            self._prepare_fill(layer, slot, k, v)
+
+    def _prepare_fill(self, layer, slot, k, v):
         length = k.shape[0]
         if layer in self.dense_layers:
             self.cache[layer][slot, 0, :, :length].copy_(k.transpose(0, 1))
@@ -98,7 +121,7 @@ class MagicPIGPool:
         offload_k = k[start:end].transpose(0, 1).contiguous()
         offload_v = v[start:end].transpose(0, 1).contiguous()
         center = (
-            offload_k.float().mean(dim=1).to(k.dtype) if end > start else torch.zeros_like(k[0])
+            offload_k.float().mean(dim=1).to(self.dtype) if end > start else torch.zeros_like(k[0])
         )
         self.centers[layer, slot].copy_(center)
         local_k = torch.cat((k[:start], k[end:]), dim=0) - center
@@ -122,7 +145,17 @@ class MagicPIGPool:
                 self.config.hash_bits,
             ).transpose(1, 2)
         assert self.native is not None
-        self.native.fill(self.cpu_layer[layer], slot, offload_k, offload_v, codes)
+        tensors = self.native.prepare_fill(offload_k, offload_v, codes)
+        ready = torch.cuda.Event()
+        ready.record()
+        native = self.native
+        cpu_layer = self.cpu_layer[layer]
+
+        def commit():
+            ready.synchronize()
+            native.commit_fill(cpu_layer, slot, tensors)
+
+        self.pending_fill = commit
 
 
 @dataclass
@@ -130,6 +163,8 @@ class MagicPIGMetadata(BaseAttnMetadata):
     last_indices: torch.Tensor
     slots: list[int]
     sparse_lengths: list[int]
+    slot_indices: torch.Tensor
+    gpu_lengths: tuple[torch.Tensor, torch.Tensor]
 
     def get_last_indices(self, bs):
         return self.last_indices[:bs]
@@ -144,6 +179,23 @@ class MagicPIGBackend(BaseAttnBackend):
         self.pool = get_global_ctx().kv_cache
         if not isinstance(self.pool, MagicPIGPool):
             raise ValueError("MagicPIG must use its own KV pool; hybrid backends are unsupported")
+        self.cpu_output_gpu = torch.empty(
+            self.pool.slots,
+            self.pool.qo_heads,
+            self.pool.head_dim,
+            device=self.pool.device,
+            dtype=self.pool.dtype,
+        )
+        self.cpu_lse_gpu = torch.empty(
+            self.pool.slots,
+            self.pool.qo_heads,
+            device=self.pool.device,
+            dtype=torch.float32,
+        )
+        self.metadata_slots = None
+        self.metadata_indices = None
+        self.metadata_gpu_indices = None
+        self.host_indptr = torch.arange(self.pool.slots + 1, dtype=torch.int32)
         self.wrappers = []
         self.workspaces = []
         for _ in range(2):
@@ -163,6 +215,8 @@ class MagicPIGBackend(BaseAttnBackend):
         if self.last_forward_event is not None:
             torch.cuda.current_stream().wait_event(self.last_forward_event)
         pool = self.pool
+        pool.finish_prefill()
+        torch.cuda.current_stream().wait_stream(pool.offload_stream)
         slots = [req.table_idx for req in batch.reqs]
         lengths = []
         offset, last = 0, []
@@ -189,25 +243,35 @@ class MagicPIGBackend(BaseAttnBackend):
             lengths.append(req.device_len - (end - start))
             offset += req.extend_len
             last.append(offset - 1)
+        if tuple(slots) != self.metadata_slots:
+            self.metadata_slots = tuple(slots)
+            self.metadata_indices = torch.tensor(slots, device="cpu", dtype=torch.int32)
+            self.metadata_gpu_indices = self.metadata_indices.to(pool.device)
+        indices = self.metadata_indices
+        host_lengths = (
+            torch.tensor(lengths, dtype=torch.int32),
+            torch.tensor([r.device_len for r in batch.reqs], dtype=torch.int32),
+        )
         batch.attn_metadata = MagicPIGMetadata(
             torch.tensor(last, device=pool.device, dtype=torch.int32),
             slots,
             lengths,
+            self.metadata_gpu_indices,
+            tuple(t.to(pool.device) for t in host_lengths),
         )
         if batch.is_decode:
             if pool.native is not None:
                 pool.native.set_batch(slots)
-            indices = torch.tensor(slots, device=pool.device, dtype=torch.int32)
-            indptr = torch.arange(len(slots) + 1, device=pool.device, dtype=torch.int32)
+            indptr = self.host_indptr[: len(slots) + 1]
             for wrapper, seq_lens, capacity in zip(
                 self.wrappers,
-                (lengths, [r.device_len for r in batch.reqs]),
+                host_lengths,
                 (pool.config.gpu_capacity, pool.max_seq_len),
             ):
                 wrapper.plan(
                     indptr,
                     indices,
-                    torch.tensor(seq_lens, device=pool.device, dtype=torch.int32),
+                    seq_lens,
                     pool.qo_heads,
                     pool.kv_heads,
                     pool.head_dim,
@@ -240,11 +304,15 @@ class MagicPIGBackend(BaseAttnBackend):
                 offset = stop
             return self._finish(torch.cat(outputs, dim=0))
         dense = layer_id in pool.dense_layers
-        for i, req in enumerate(batch.reqs):
-            position = req.device_len - 1 if dense else metadata.sparse_lengths[i] - 1
-            key = k[i] if dense else k[i] - pool.centers[layer_id, req.table_idx]
-            pool.cache[layer_id][req.table_idx, 0, :, position].copy_(key)
-            pool.cache[layer_id][req.table_idx, 1, :, position].copy_(v[i])
+        append_kv(
+            k,
+            v,
+            pool.centers[layer_id],
+            pool.cache[layer_id],
+            metadata.slot_indices,
+            metadata.gpu_lengths[int(dense)],
+            not dense,
+        )
         wrapper = self.wrappers[int(dense)]
         if dense:
             return self._finish(wrapper.run(q, pool.cache[layer_id]))
@@ -255,13 +323,23 @@ class MagicPIGBackend(BaseAttnBackend):
         gpu_output, gpu_lse = wrapper.run_return_lse(q, pool.cache[layer_id])
         assert pool.native is not None
         cpu_output, cpu_lse = pool.native.decode(pool.cpu_layer[layer_id], metadata.slots)
+        count = len(metadata.slots)
+        self.cpu_output_gpu[:count].copy_(cpu_output, non_blocking=True)
+        self.cpu_lse_gpu[:count].copy_(cpu_lse, non_blocking=True)
         output, _ = self.fi.merge_state(
             gpu_output,
             gpu_lse,
-            cpu_output.to(pool.device, non_blocking=True),
-            cpu_lse.to(pool.device, non_blocking=True),
+            self.cpu_output_gpu[:count],
+            self.cpu_lse_gpu[:count],
         )
         return self._finish(output)
+
+    def finish_prefill(self):
+        self.pool.finish_prefill()
+        torch.cuda.current_stream().wait_stream(self.pool.offload_stream)
+
+    def shutdown(self):
+        self.pool.close()
 
     def _finish(self, output):
         if self.last_forward_event is None:

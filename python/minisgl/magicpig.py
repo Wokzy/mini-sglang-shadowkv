@@ -58,7 +58,12 @@ def partition_prompt(length: int, config: MagicPIGConfig) -> tuple[int, int]:
 
 def hash_vectors(vectors: torch.Tensor, projection: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack SimHash into int16, without FP16 integer rounding for K > 11."""
-    signs = (vectors @ projection > 0).reshape(*vectors.shape[:-1], -1, bits)
+    projected = vectors @ projection
+    if vectors.is_cuda:
+        from minisgl.kernel.magicpig import pack_hashes
+
+        return pack_hashes(projected, bits)
+    signs = (projected > 0).reshape(*vectors.shape[:-1], -1, bits)
     weights = 1 << torch.arange(bits, device=vectors.device, dtype=torch.int32)
     return (signs.to(torch.int32) * weights).sum(-1).to(torch.int16)
 
@@ -75,7 +80,7 @@ class NativeMagicPIG:
                 "MagicPIG CPU extensions are missing. Run tools/build_magicpig.py with the "
                 "same Python/PyTorch environment as MiniSGL (see docs/magicpig.md)."
             ) from exc
-        if lsh.adapter_version != 1 or sparse.adapter_version != 1:
+        if lsh.adapter_version != 2 or sparse.adapter_version != 2:
             raise RuntimeError("Rebuild MagicPIG CPU extensions with tools/build_magicpig.py")
         self.config = config
         self.slots, self.qo_heads = slots, qo_heads
@@ -89,50 +94,50 @@ class NativeMagicPIG:
         rows = slots * qo_heads
         self.codes = torch.zeros(rows, config.hash_tables, dtype=torch.int32, pin_memory=pin)
         self.query = torch.zeros(rows, head_dim, dtype=torch.bfloat16, pin_memory=pin)
-        self.staged_query = torch.empty(self.query.shape, dtype=torch.bfloat16, pin_memory=pin)
-        self.staged_codes = torch.empty(self.codes.shape, dtype=torch.int32, pin_memory=pin)
         self.copy_event = None
         self.batch_slots = None
-        self.prefix_batch = False
-        self.packed_output = torch.empty(
-            slots, qo_heads, head_dim, dtype=torch.bfloat16, pin_memory=pin
-        )
-        self.packed_lse = torch.empty(slots, qo_heads, dtype=torch.float32, pin_memory=pin)
         self.indices = torch.zeros(rows, self.max_length, dtype=torch.int32)
         self.nnz = torch.zeros(rows, dtype=torch.int32)
         self.output = torch.zeros(rows, head_dim, dtype=torch.bfloat16, pin_memory=pin)
         self.stats = torch.zeros(2, rows, dtype=torch.float32, pin_memory=pin)
 
-    def fill(self, layer, slot, keys, values, codes):
-        # CPU copies are blocking: native extensions immediately dereference the pointers.
-        keys = keys.to(device="cpu", dtype=torch.bfloat16).contiguous()
-        values = values.to(device="cpu", dtype=torch.bfloat16).contiguous()
-        norms = keys.float().norm(dim=-1).contiguous()
-        self.attention.fill(layer, slot, keys, values, norms)
+    def prepare_fill(self, keys, values, codes):
+        # Compute the FP32 norm on the source GPU, without materializing FP32 keys.
+        norms = torch.linalg.vector_norm(keys, dim=-1, dtype=torch.float32)
         sorted_codes, indices = codes.sort(dim=-1)
-        self.lsh.fill(
-            layer,
-            slot,
-            sorted_codes.cpu().contiguous(),
-            indices.to(device="cpu", dtype=torch.int32).contiguous(),
-        )
+        indices = indices.to(torch.int32)
+        tensors = (keys, values, norms, sorted_codes, indices)
+        if not keys.is_cuda:
+            return tuple(t.contiguous() for t in tensors)
+        host = tuple(torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in tensors)
+        for dst, src in zip(host, tensors):
+            dst.copy_(src, non_blocking=True)
+        return host
+
+    def commit_fill(self, layer, slot, tensors):
+        keys, values, norms, codes, indices = tensors
+        self.attention.fill(layer, slot, keys, values, norms)
+        self.lsh.fill(layer, slot, codes, indices)
+
+    def fill(self, layer, slot, keys, values, codes):
+        tensors = self.prepare_fill(keys, values, codes)
+        if keys.is_cuda:
+            torch.cuda.current_stream().synchronize()
+        self.commit_fill(layer, slot, tensors)
 
     def set_batch(self, slots):
         slots = tuple(slots)
         if slots == self.batch_slots:
             return
+        if len(set(slots)) != len(slots) or any(s < 0 or s >= self.slots for s in slots):
+            raise ValueError("Invalid or duplicate MagicPIG request slots")
         self.batch_slots = slots
-        self.prefix_batch = slots == tuple(range(len(slots)))
         self.slot_indices = torch.tensor(slots, dtype=torch.int64)
-        self.inactive = torch.ones(self.slots, dtype=torch.bool)
-        self.inactive[self.slot_indices] = False
 
     def stage(self, queries, codes):
         rows = queries.shape[0] * self.qo_heads
-        target_query = self.query if self.prefix_batch else self.staged_query
-        target_codes = self.codes if self.prefix_batch else self.staged_codes
-        target_query[:rows].copy_(queries.reshape(rows, -1), non_blocking=True)
-        target_codes[:rows].copy_(codes.reshape(rows, -1), non_blocking=True)
+        self.query[:rows].copy_(queries.reshape(rows, -1), non_blocking=True)
+        self.codes[:rows].copy_(codes.reshape(rows, -1), non_blocking=True)
         if queries.is_cuda:
             if self.copy_event is None:
                 self.copy_event = torch.cuda.Event()
@@ -148,34 +153,22 @@ class NativeMagicPIG:
         if self.copy_event is not None:
             self.copy_event.synchronize()
         count = len(slots)
-        if not self.prefix_batch:
-            # Preserve packed order for arbitrary scheduler slots, including reordered batches.
-            self.query.view(self.slots, self.qo_heads, -1).index_copy_(
-                0, self.slot_indices, self.staged_query.view(self.slots, self.qo_heads, -1)[:count]
-            )
-            self.codes.view(self.slots, self.qo_heads, -1).index_copy_(
-                0, self.slot_indices, self.staged_codes.view(self.slots, self.qo_heads, -1)[:count]
-            )
-        self.lsh.batch_retrieve(layer, self.codes, self.indices, self.nnz)
-        if count != self.slots:
-            self.nnz.view(self.slots, self.qo_heads)[self.inactive] = 0
-        self.attention.attention_wrapper(
+        rows = count * self.qo_heads
+        self.lsh.batch_retrieve_active(layer, self.slot_indices, self.codes, self.indices, self.nnz)
+        self.attention.attention_active(
             layer,
+            self.slot_indices,
             self.config.hash_bits,
             self.config.hash_tables,
             self.output,
             self.stats,
             self.query,
-            self.query.float().norm(dim=-1),
+            self.query[:rows].float().norm(dim=-1),
             self.indices,
             self.nnz,
         )
-        # stats[1] is log2(sum(exp(corrected logits))), as expected by flashinfer.merge_state.
-        output = self.output.view(self.slots, self.qo_heads, -1)
-        lse = self.stats[1].view(self.slots, self.qo_heads)
-        if self.prefix_batch:
-            return output[:count], lse[:count]
-        # Advanced indexing would allocate pageable memory and prevent async H2D.
-        torch.index_select(output, 0, self.slot_indices, out=self.packed_output[:count])
-        torch.index_select(lse, 0, self.slot_indices, out=self.packed_lse[:count])
-        return self.packed_output[:count], self.packed_lse[:count]
+        # Packed results follow active request order, regardless of pool slot IDs.
+        return (
+            self.output[:rows].view(count, self.qo_heads, -1),
+            self.stats[1, :rows].view(count, self.qo_heads),
+        )

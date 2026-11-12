@@ -30,7 +30,9 @@ def backend(monkeypatch, request):
     ctx = core.Context(page_size=1)
     ctx.kv_cache = pool
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
-    return MagicPIGBackend(model)
+    instance = MagicPIGBackend(model)
+    yield instance
+    instance.shutdown()
 
 
 def make_batch(slot, length, uid=0):
@@ -91,12 +93,12 @@ def test_sparse_cpu_gpu_merge_uses_same_center_and_log_base(backend):
     local_v = pool.cache[0][1, 1, :, :length].transpose(0, 1)
     local_out, local_lse = exact(q1, local_k, local_v)
     native = pool.native
-    cpu_out = native.output.view(2, 4, 128)[1:2].cuda().float()
-    cpu_lse = native.stats[1].view(2, 4)[1:2].cuda() * torch.log(torch.tensor(2.0, device="cuda"))
+    cpu_out = native.output.view(2, 4, 128)[:1].cuda().float()
+    cpu_lse = native.stats[1].view(2, 4)[:1].cuda() * torch.log(torch.tensor(2.0, device="cuda"))
     weights = torch.stack((local_lse, cpu_lse), dim=-1).softmax(-1)
     expected = weights[..., :1] * local_out + weights[..., 1:] * cpu_out
     torch.testing.assert_close(result.float(), expected, atol=0.025, rtol=0.03)
-    assert native.nnz[:4].sum() == 0  # unused slot cannot contribute
+    assert native.nnz[4:].sum() == 0  # only packed active rows are written
 
 
 def test_slot_reuse_and_generation_limit(backend):
@@ -148,3 +150,82 @@ def test_decode_batch_reorders_and_shrinks(backend):
     actual = backend.forward(q_next, k_next, v_next, 0, batch)
     expected, _ = exact(q_next, torch.cat((k1, k[:1], k_next)), torch.cat((v1, v[:1], v_next)))
     torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.03)
+
+
+@pytest.mark.parametrize("bits", [2, 10, 11, 15])
+def test_gpu_hash_packing_matches_integer_reference(bits):
+    from minisgl.magicpig import hash_vectors
+
+    q = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16)
+    projection = torch.randn(128, bits * 13, device="cuda", dtype=torch.bfloat16)
+    signs = (q @ projection > 0).reshape(2, 4, 13, bits).int()
+    expected = (signs * (1 << torch.arange(bits, device="cuda"))).sum(-1).short()
+    torch.testing.assert_close(hash_vectors(q, projection, bits), expected)
+
+
+def test_deferred_prefill_failure_is_propagated(backend, monkeypatch):
+    def fail(*args):
+        raise RuntimeError("native fill failed")
+
+    monkeypatch.setattr(backend.pool.native, "commit_fill", fail)
+    batch = make_batch(0, 37)
+    backend.prepare_metadata(batch)
+    backend.forward(*tensors(37), 0, batch)
+    with pytest.raises(RuntimeError, match="native fill failed"):
+        backend.finish_prefill()
+
+
+@pytest.mark.parametrize("center", [False, True])
+def test_batched_append_matches_reference_for_strided_kv(center):
+    from minisgl.kernel.magicpig import append_kv
+
+    # Slices of a fused QKV projection are not contiguous along the batch axis.
+    qkv = torch.randn(8, 12, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = qkv[:, 4:8], qkv[:, 8:12]
+    centers = torch.randn(10, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(10, 2, 4, 32, 128, device="cuda", dtype=torch.bfloat16)
+    expected = cache.clone()
+    slots = [8, 2, 9, 1, 0, 5, 3, 7]
+    lengths = [3, 7, 1, 32, 11, 4, 2, 15]
+    for i, (slot, length) in enumerate(zip(slots, lengths)):
+        expected[slot, 0, :, length - 1] = k[i] - centers[slot] if center else k[i]
+        expected[slot, 1, :, length - 1] = v[i]
+    append_kv(
+        k,
+        v,
+        centers,
+        cache,
+        torch.tensor(slots, device="cuda", dtype=torch.int32),
+        torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        center,
+    )
+    torch.testing.assert_close(cache, expected, atol=0, rtol=0)
+
+
+def test_deferred_fill_preserves_kv_and_fp32_norms(backend):
+    batch = make_batch(1, 37)
+    q, k, v = tensors(37)
+    backend.prepare_metadata(batch)
+    backend.forward(q, k, v, 0, batch)
+    backend.finish_prefill()
+    pool = backend.pool
+    # The middle of this prompt excludes two sink and three local tokens.
+    keys = k[2:-3].transpose(0, 1).contiguous()
+    center = keys.float().mean(dim=1).bfloat16()
+    centered = (keys - center[:, None]).cpu()
+    torch.testing.assert_close(pool.centers[0, 1].cpu(), center.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(
+        pool.native.attention.get_key_cache(0)[1, :, :32], centered, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        pool.native.attention.get_value_cache(0)[1, :, :32],
+        v[2:-3].transpose(0, 1).cpu(),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        pool.native.attention.get_key_norm(0)[1, :, :32],
+        centered.float().norm(dim=-1),
+        atol=2e-6,
+        rtol=2e-7,
+    )

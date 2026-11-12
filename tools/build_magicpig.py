@@ -12,6 +12,8 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
+from magicpig_active import add_active_api
+
 REVISION = "ac9aa36c866330ca6ad2ce342a7848d7df6f49bb"
 
 
@@ -81,11 +83,13 @@ float *expsum) {
         replace_once(
             filename,
             f"PYBIND11_MODULE({original}, m) {{",
-            f'PYBIND11_MODULE({module}, m) {{\n    m.attr("adapter_version") = 1;',
+            f'PYBIND11_MODULE({module}, m) {{\n    m.attr("adapter_version") = 2;',
         )
     for path in (destination / "lsh/lsh.h", destination / "sparse_attention/sparse_attention.h"):
         path.write_text(path.read_text().replace("THREADS 64", f"THREADS {threads}"))
     sparse.write_text(sparse.read_text().replace("num_threads(64)", f"num_threads({threads})"))
+
+    add_active_api(destination)
 
 
 def main():
@@ -95,10 +99,19 @@ def main():
     parser.add_argument(
         "--source", type=Path, help="Offline checkout of the pinned upstream revision"
     )
-    parser.add_argument("--bf16", action="store_true", help="Compile AVX512_BF16 kernels")
+    parser.add_argument(
+        "--bf16",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable AVX512_BF16 (default: detect build-host CPU; override for a different target)",
+    )
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be positive")
+    if args.bf16 is None:
+        cpuinfo = Path("/proc/cpuinfo")
+        args.bf16 = cpuinfo.exists() and "avx512_bf16" in cpuinfo.read_text().split()
+    print(f"MagicPIG build: threads={args.threads}, AVX512_BF16={args.bf16}", flush=True)
     root = args.build_dir.resolve()
     prepare_sources(root / "sources", args.threads, args.source)
     # BuildExtension selects the installed torch ABI; upstream hardcodes the old ABI.

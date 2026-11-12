@@ -230,6 +230,8 @@ class Engine:
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+            if batch.is_prefill:
+                self.attn_backend.finish_prefill()
 
         for req in batch.reqs:
             req.complete_one()
@@ -241,6 +243,7 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
+        self.attn_backend.shutdown()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

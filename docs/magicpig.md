@@ -8,7 +8,7 @@ Prefill uses FlashInfer full causal attention. For sparse layers, prompt keys ar
 
 Use the **same Python environment and PyTorch installation as the server**. This does not replace PyTorch or install the authors' old CUDA/FlashInfer environment. The existing MiniSGL dependencies, including FlashInfer, must already be installed.
 
-Requirements: Linux x86-64 CPU with AVX-512, C++ compiler compatible with the installed PyTorch, OpenMP, setuptools, and optionally ninja. `--bf16` additionally requires AVX512_BF16 and GCC >=11; omit it to use the authors' AVX-512 conversion kernels while retaining BF16 KV storage.
+Requirements: Linux x86-64 CPU with AVX-512, C++ compiler compatible with the installed PyTorch, OpenMP, setuptools, and optionally ninja. `--bf16` additionally requires AVX512_BF16 and GCC >=11. By default the script detects AVX512_BF16 on the build host and prints the chosen mode; use `--bf16` explicitly when building for a compatible target on another host, or `--no-bf16` for the authors' AVX-512 conversion kernels while retaining BF16 KV storage.
 
 From the repository root:
 
@@ -18,7 +18,7 @@ export PYTHONPATH="$PWD/work/magicpig-native/lib:$PWD/python${PYTHONPATH:+:$PYTH
 python -m pytest -q tests/magicpig
 ```
 
-Choose a **new build directory** when rebuilding. The script downloads revision `ac9aa36c866330ca6ad2ce342a7848d7df6f49bb` and edits only its private copy. For an offline build, pass `--source /path/to/checkout-of-that-revision`. Choose `--threads` for the physical cores available **per TP rank**; set `OMP_NUM_THREADS` too, because upstream table construction also uses OpenMP's default team size. Bind CPU cores/NUMA memory consistently between benchmarks.
+Choose a **new build directory** when rebuilding. The active-slot adapter requires native ABI version 2: rebuild both extensions after updating from the original integration; older binaries are rejected. The script downloads revision `ac9aa36c866330ca6ad2ce342a7848d7df6f49bb` and edits only its private copy. For an offline build, pass `--source /path/to/checkout-of-that-revision`. Choose `--threads` for the physical cores available **per TP rank**; set `OMP_NUM_THREADS` too, because upstream table construction also uses OpenMP's default team size. Bind CPU cores/NUMA memory consistently between benchmarks.
 
 The build uses the installed PyTorch ABI instead of the upstream hardcoded old ABI. The following serving fixes are explicit in the build script: reset a slot's LSH buckets before refilling; give empty samples zero mass (`LSE=-inf`); clamp the cosine before `acos` and handle zero norms. The upstream probability stabilizer `+1e-4` is preserved. Extensions have separate `minisgl_magicpig_*` names so unrelated `lsh` packages cannot be loaded accidentally. Upstream Apache-2.0/third-party licenses remain in the downloaded source tree.
 
@@ -73,7 +73,13 @@ python benchmark/offline/compare_attention.py --model /path/to/model --method ma
 
 The runner warms up, uses greedy fixed-length generation, saves generated texts/token IDs, and reports **end-to-end throughput including prefill** as the median of `--repeats` runs (default 3). Per-run durations are retained. Dense uses FlashInfer by default (`--dense-backend fi`); `--dense-backend fa` selects FlashAttention (on B200, also use `--page-size 128`; `--num-pages` then counts 128-token pages). All methods run without CUDA graphs. Record this when comparing with a graph-enabled deployment. It also reports PyTorch peak GPU allocation/reservation and the current process's lifetime peak RSS (including startup/warmup). Those are not total GPU usage or a cgroup/process-tree memory peak. For capacity comparisons, additionally measure total device memory and the cgroup/process tree in fresh runs, repeating each measurement. Assess quality with the same task scorer on the saved outputs; output agreement with dense decoding alone is not a quality benchmark.
 
-This is a MiniSGL integration of the official CPU kernels, not a reproduction of the authors' entire serving scheduler. In particular, prefill table construction here is synchronous; partial batches still query the native tables sized for the configured slot count. Record these overheads when interpreting timing. Do not claim paper speedups without measurements on the target GPU/CPU.
+This is a MiniSGL integration of the official CPU kernels, not a reproduction of the authors' entire serving scheduler. Prefill centering, hashing, GPU norms and transfers run on a separate CUDA stream; the host commits the previous layer’s native KV/LSH fill after subsequent GPU attention has been submitted. Native work stays on the calling thread to avoid creating competing OpenMP teams. At most one native layer fill is outstanding. The engine drains pending work before completing prefill, and before decode, slot reuse or shutdown; fill failures propagate to the caller. Full CPU/GPU overlap depends on the workload and is not guaranteed.
+
+Native ABI version 2 accepts explicit active slot IDs. Retrieval and attention use packed active query/output rows and touch only the selected slots' KV/LSH tables, without copying the KV cache. The native attention formula and sampling probabilities remain unchanged; the active attention path uses dynamic scheduling over active heads. Inactive scratch rows are intentionally left untouched. GPU decode appends all requests with one fused kernel; hash signs are packed with an integer Triton kernel (including K > 11), and GPU CPU-result buffers are reused. FlashInfer planning receives CPU indptr/lengths, avoiding a GPU-to-CPU metadata round trip.
+
+Prefill key norms now accumulate in FP32 on GPU. Reduction order differs from the old CPU FP32 norm, so tiny rounding changes can alter BF16 attention outputs and subsequent greedy tokens. Bitwise agreement with the original generation is not guaranteed; evaluate quality on the same tasks.
+
+Persistent cache capacity still scales with the configured maximum batch and context. Query D2H synchronization and CPU attention remain on the decode critical path. Do not claim paper speedups without measurements on the target GPU/CPU.
 
 Tests in `test_native.py` run on CPU and verify native selection, importance weighting, LSE, empty samples, GQA, and slot reuse. `test_gpu.py` exercises actual FlashInfer merging and KV lifecycle and is skipped without CUDA. Full-model timing is separate from these correctness tests.
 
@@ -81,7 +87,7 @@ Tests in `test_native.py` run on CPU and verify native selection, importance wei
 
 Add `--profile-phases` to the comparison runner. After the uninstrumented end-to-end measurement it runs a separate pass, synchronizing the engine stream around each forward. The report includes mean/median/p95 forward latency for prefill and decode, and decode tokens/s for forward computation only. This includes CPU attention and GPU completion, but excludes scheduler preparation; it is not an inter-token latency measurement of a serving endpoint. Compare the same mode across methods. The separate profile does not alter the earlier end-to-end throughput or memory measurements.
 
-The decode adapter reuses query-copy events and batch mappings. Contiguous request slots use direct pinned input/output views; reordered batches gather into reusable pinned buffers. Results return to GPU asynchronously. The next query-copy event also orders reuse of the CPU result storage after the previous H2D copy.
+The decode adapter reuses query-copy events and batch mappings. All batches use packed pinned input/output views; native kernels map those rows to physical request slots without scatter/gather copies. Results return to GPU asynchronously. The next query-copy event also orders reuse of the CPU result storage after the previous H2D copy.
 
 ### B200 environment and baseline
 
@@ -102,7 +108,7 @@ OMP_NUM_THREADS=16 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=ACTIVE \
 
 Use native extensions built with `--threads 16` for this example. OpenMP waiting policy can materially affect a CPU/GPU pipeline; record it along with affinity and compiled thread count. Compare real task inputs: LSH selection size depends on the queries and keys, so repeated synthetic text is only a diagnostic workload.
 
-### Measured B200 diagnostic workload (2026-11-09)
+### Historical B200 diagnostic workload before active-slot/overlap optimizations (2026-11-09)
 
 Qwen3-32B BF16, batch 1, 64 output tokens, 16 pinned Xeon 6960P cores, OpenMP ACTIVE, one warmup and three timed repetitions. Inputs repeat a synthetic sentence and are **not a quality benchmark or paper-speedup reproduction**. All methods disable CUDA graphs. End-to-end throughput includes prefill; decode forward is measured in a separate synchronized pass.
 

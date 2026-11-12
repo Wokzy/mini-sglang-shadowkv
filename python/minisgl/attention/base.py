@@ -12,32 +12,32 @@ if TYPE_CHECKING:
 @dataclass
 class BaseAttnMetadata(ABC):
     @abstractmethod
-    def get_last_indices(self, bs: int) -> torch.Tensor:
-        ...
+    def get_last_indices(self, bs: int) -> torch.Tensor: ...
 
 
 class BaseAttnBackend(ABC):
+    def finish_prefill(self) -> None:
+        """Complete deferred cache construction before releasing a prefill batch."""
+
+    def shutdown(self) -> None:
+        """Complete pending backend work before engine teardown."""
+
     @abstractmethod
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
-    ) -> torch.Tensor:
-        ...
+    ) -> torch.Tensor: ...
 
     @abstractmethod
-    def prepare_metadata(self, batch: Batch) -> None:
-        ...
+    def prepare_metadata(self, batch: Batch) -> None: ...
 
     @abstractmethod
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        ...
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None: ...
 
     @abstractmethod
-    def prepare_for_capture(self, batch: Batch) -> None:
-        ...
+    def prepare_for_capture(self, batch: Batch) -> None: ...
 
     @abstractmethod
-    def prepare_for_replay(self, batch: Batch) -> None:
-        ...
+    def prepare_for_replay(self, batch: Batch) -> None: ...
 
 
 class HybridBackend(BaseAttnBackend):
@@ -58,6 +58,14 @@ class HybridBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.prepare_metadata(batch)
+
+    def finish_prefill(self) -> None:
+        self.prefill_backend.finish_prefill()
+
+    def shutdown(self) -> None:
+        self.prefill_backend.shutdown()
+        if self.decode_backend is not self.prefill_backend:
+            self.decode_backend.shutdown()
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.decode_backend.init_capture_graph(max_seq_len, bs_list)

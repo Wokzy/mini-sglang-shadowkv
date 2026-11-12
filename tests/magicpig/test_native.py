@@ -120,8 +120,8 @@ def test_reordered_batch_and_inactive_slots(native):
     torch.testing.assert_close(output[0].float(), torch.full((4, 128), -3.0))
     torch.testing.assert_close(output[1].float(), torch.full((4, 128), 2.0))
     output, _ = native.decode(0, [1], queries[:1], codes[:1])
-    assert native.nnz[:4].tolist() == [0, 0, 0, 0]
-    assert torch.isfinite(output).all()
+    assert native.nnz[:4].tolist() == [33, 33, 33, 33]
+    torch.testing.assert_close(output.float(), torch.full((1, 4, 128), -3.0))
 
 
 def test_short_prompt_with_empty_cpu_cache(native):
@@ -165,3 +165,46 @@ def test_direct_staging_then_empty_selection_does_not_reuse_old_output(native):
     output, lse = native.decode(0, [0])
     assert (output == 0).all()
     assert torch.isneginf(lse).all()
+
+
+def test_active_retrieval_does_not_touch_inactive_scratch(native):
+    fill(native, 0, 17)
+    fill(native, 1, 33)
+    native.nnz.fill_(-123)
+    native.lsh.get_mask().fill_(99)
+    native.decode(0, [1], torch.ones(1, 4, 128), torch.zeros(1, 4, 3))
+    assert native.nnz[:4].tolist() == [33] * 4
+    assert native.nnz[4:].tolist() == [-123] * 4
+    assert (native.lsh.get_mask()[1] == 99).all()
+
+
+@pytest.mark.parametrize("slots", [[2], [-1], [0, 0]])
+def test_invalid_active_slots(native, slots):
+    with pytest.raises(ValueError, match="slots"):
+        native.set_batch(slots)
+
+
+@pytest.mark.parametrize("slots", [[1], [1, 0], [0]])
+def test_active_api_matches_upstream_arithmetic(native, slots):
+    fill(native, 0, 17)
+    fill(native, 1, 33)
+    native.query.copy_(torch.randn_like(native.query))
+    native.codes.zero_()
+    native.lsh.batch_retrieve(0, native.codes, native.indices, native.nnz)
+    native.attention.attention_wrapper(
+        0,
+        2,
+        3,
+        native.output,
+        native.stats,
+        native.query,
+        native.query.float().norm(dim=-1),
+        native.indices,
+        native.nnz,
+    )
+    expected = native.output.view(2, 4, 128)[slots].clone()
+    expected_lse = native.stats[1].view(2, 4)[slots].clone()
+    query = native.query.view(2, 4, 128)[slots].clone()
+    actual, lse = native.decode(0, slots, query, torch.zeros(len(slots), 4, 3))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
